@@ -101,9 +101,11 @@ impl Trade {
     }
 
     /// Returns the notional value of the trade.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 
     /// Returns true if this is a buy trade.
@@ -337,23 +339,31 @@ impl MarketSnapshot {
     }
 
     /// Returns the mid price.
+    ///
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        (self.bid + self.ask) / Decimal::from(2)
+        crate::types::decimal::midpoint(self.bid, self.ask)
     }
 
     /// Returns the spread.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
-        self.ask - self.bid
+        self.ask.saturating_sub(self.bid)
     }
 
     /// Returns the spread in basis points.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            self.spread() / mid * Decimal::from(10000)
+            // An overflow is an extreme spread, never a zero one.
+            crate::types::decimal::saturating_div(self.spread(), mid)
+                .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO
         }
@@ -364,6 +374,14 @@ impl MarketSnapshot {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_market_snapshot_spread_bps_overflow_is_a_signed_bound() {
+        let wide = |bid, ask| MarketSnapshot::new("BTC", bid, ask, dec!(0), dec!(0), 0);
+        let (low, high) = (dec!(-5), dec!(5.0000000000000000000000000002));
+        assert_eq!(wide(low, high).spread_bps(), Decimal::MAX);
+        assert_eq!(wide(high, low).spread_bps(), Decimal::MIN);
+    }
 
     #[test]
     fn test_price_update_new() {

@@ -6,8 +6,8 @@
 //! Run with: `cargo run --example orderbook_connector`
 
 use market_maker_rs::execution::{
-    ExchangeConnector, OrderBookConnector, OrderBookConnectorConfig, OrderRequest, OrderType, Side,
-    TimeInForce,
+    Action, ExchangeConnector, OrderBookConnector, OrderBookConnectorConfig, OrderRequest,
+    OrderType, TimeInForce,
 };
 use rust_decimal_macros::dec;
 
@@ -23,7 +23,8 @@ async fn main() {
         fee_currency: "USD".to_string(),
     };
 
-    let connector = OrderBookConnector::with_config("BTC-USD", config);
+    let connector =
+        OrderBookConnector::with_config("BTC-USD", config).expect("valid connector precision");
 
     println!("Connector Configuration:");
     println!("  Symbol: BTC-USD");
@@ -33,8 +34,12 @@ async fn main() {
     println!();
 
     // Set initial balance
-    connector.set_balance("USD", dec!(100000.0));
-    connector.set_balance("BTC", dec!(10.0));
+    connector
+        .set_balance("USD", dec!(100000.0))
+        .expect("fresh connector lock");
+    connector
+        .set_balance("BTC", dec!(10.0))
+        .expect("fresh connector lock");
 
     println!("Initial Balances:");
     let usd_balance = connector
@@ -54,7 +59,7 @@ async fn main() {
 
     let buy_order = OrderRequest {
         symbol: "BTC-USD".to_string(),
-        side: Side::Buy,
+        side: Action::Buy,
         order_type: OrderType::Limit,
         quantity: dec!(0.5),
         price: Some(dec!(49000.0)),
@@ -79,7 +84,7 @@ async fn main() {
     // Submit a limit sell order
     let sell_order = OrderRequest {
         symbol: "BTC-USD".to_string(),
-        side: Side::Sell,
+        side: Action::Sell,
         order_type: OrderType::Limit,
         quantity: dec!(0.3),
         price: Some(dec!(51000.0)),

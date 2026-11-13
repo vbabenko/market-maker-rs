@@ -68,8 +68,9 @@
 //! ```
 
 use crate::Decimal;
-use crate::types::decimal::decimal_sqrt;
+use crate::types::decimal::{OrOverflow, decimal_sqrt};
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -181,14 +182,16 @@ impl CorrelationMatrix {
     #[must_use]
     pub fn new(assets: Vec<AssetId>) -> Self {
         let n = assets.len();
-        // Upper triangle size: n * (n + 1) / 2
-        let size = n * (n + 1) / 2;
+        // Upper triangle size: n * (n + 1) / 2. An asset count large enough
+        // to saturate this could not be allocated anyway.
+        let size = n.saturating_mul(n.saturating_add(1)) / 2;
         let mut correlations = vec![Decimal::ZERO; size];
 
         // Set diagonal to 1.0
         for i in 0..n {
-            let idx = Self::index_for(i, i, n);
-            correlations[idx] = Decimal::ONE;
+            if let Some(diagonal) = correlations.get_mut(Self::index_for(i, i, n)) {
+                *diagonal = Decimal::ONE;
+            }
         }
 
         Self {
@@ -223,9 +226,18 @@ impl CorrelationMatrix {
     }
 
     /// Calculates the flat index for position (i, j) in upper triangle.
+    ///
+    /// Saturates to `usize::MAX`, an index no matrix holds, so a lookup
+    /// that overflowed finds nothing instead of a wrong slot.
     fn index_for(i: usize, j: usize, n: usize) -> usize {
         let (row, col) = if i <= j { (i, j) } else { (j, i) };
-        row * n - row * (row + 1) / 2 + col
+        row.checked_mul(n)
+            .and_then(|a| {
+                let skipped = row.checked_mul(row.checked_add(1)?)?.checked_div(2)?;
+                a.checked_sub(skipped)
+            })
+            .and_then(|a| a.checked_add(col))
+            .unwrap_or(usize::MAX)
     }
 
     /// Gets the index of an asset in the matrix.
@@ -241,7 +253,7 @@ impl CorrelationMatrix {
         let i = self.asset_index(asset1)?;
         let j = self.asset_index(asset2)?;
         let idx = Self::index_for(i, j, self.assets.len());
-        Some(self.correlations[idx])
+        self.correlations.get(idx).copied()
     }
 
     /// Sets the correlation between two assets.
@@ -288,7 +300,10 @@ impl CorrelationMatrix {
         }
 
         let idx = Self::index_for(i, j, self.assets.len());
-        self.correlations[idx] = correlation;
+        let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+            MMError::NumericalError(format!("correlation index {idx} out of range"))
+        })?;
+        *slot = correlation;
 
         Ok(())
     }
@@ -337,18 +352,22 @@ impl CorrelationMatrix {
         }
 
         // Calculate correlations for each pair
-        for i in 0..self.assets.len() {
-            for j in i..self.assets.len() {
-                if i == j {
-                    continue; // Diagonal stays 1.0
-                }
-
-                let returns_i = returns.get(&self.assets[i]).unwrap();
-                let returns_j = returns.get(&self.assets[j]).unwrap();
+        let missing = |asset: &AssetId| {
+            MMError::InvalidConfiguration(format!("missing returns for {asset:?}"))
+        };
+        let n = self.assets.len();
+        for (i, asset_i) in self.assets.iter().enumerate() {
+            for (j, asset_j) in self.assets.iter().enumerate().skip(i.saturating_add(1)) {
+                // The diagonal stays 1.0.
+                let returns_i = returns.get(asset_i).ok_or_else(|| missing(asset_i))?;
+                let returns_j = returns.get(asset_j).ok_or_else(|| missing(asset_j))?;
 
                 let correlation = Self::calculate_correlation(returns_i, returns_j)?;
-                let idx = Self::index_for(i, j, self.assets.len());
-                self.correlations[idx] = correlation;
+                let idx = Self::index_for(i, j, n);
+                let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+                    MMError::NumericalError(format!("correlation index {idx} out of range"))
+                })?;
+                *slot = correlation;
             }
         }
 
@@ -366,20 +385,35 @@ impl CorrelationMatrix {
         let n_dec = Decimal::from(n);
 
         // Calculate means
-        let mean_x: Decimal = x.iter().copied().sum::<Decimal>() / n_dec;
-        let mean_y: Decimal = y.iter().copied().sum::<Decimal>() / n_dec;
+        let mean = |v: &[Decimal]| {
+            v.iter()
+                .try_fold(Decimal::ZERO, |acc, &x| acc.checked_add(x))
+                .and_then(|sum| sum.checked_div(n_dec))
+                .or_overflow("return mean")
+        };
+        let mean_x = mean(x)?;
+        let mean_y = mean(y)?;
 
         // Calculate covariance and variances
         let mut cov = Decimal::ZERO;
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
-        for i in 0..n {
-            let dx = x[i] - mean_x;
-            let dy = y[i] - mean_y;
-            cov += dx * dy;
-            var_x += dx * dx;
-            var_y += dy * dy;
+        for (&xi, &yi) in x.iter().zip(y) {
+            let dx = xi.checked_sub(mean_x).or_overflow("return deviation")?;
+            let dy = yi.checked_sub(mean_y).or_overflow("return deviation")?;
+            cov = dx
+                .checked_mul(dy)
+                .and_then(|p| cov.checked_add(p))
+                .or_overflow("covariance")?;
+            var_x = dx
+                .checked_mul(dx)
+                .and_then(|p| var_x.checked_add(p))
+                .or_overflow("variance")?;
+            var_y = dy
+                .checked_mul(dy)
+                .and_then(|p| var_y.checked_add(p))
+                .or_overflow("variance")?;
         }
 
         if var_x.is_zero() || var_y.is_zero() {
@@ -387,12 +421,12 @@ impl CorrelationMatrix {
         }
 
         // Correlation = cov / sqrt(var_x * var_y)
-        let denominator = decimal_sqrt(var_x * var_y)?;
+        let denominator = decimal_sqrt(var_x.checked_mul(var_y).or_overflow("variance product")?)?;
         if denominator.is_zero() {
             return Ok(Decimal::ZERO);
         }
 
-        let correlation = cov / denominator;
+        let correlation = cov.checked_div(denominator).or_overflow("correlation")?;
 
         // Clamp to [-1, 1] to handle numerical errors
         Ok(correlation.max(Decimal::NEGATIVE_ONE).min(Decimal::ONE))
@@ -409,8 +443,9 @@ impl CorrelationMatrix {
 
         for i in 0..n {
             for j in i..n {
-                let idx = Self::index_for(i, j, n);
-                let corr = self.correlations[idx];
+                let Some(&corr) = self.correlations.get(Self::index_for(i, j, n)) else {
+                    return false;
+                };
 
                 if i == j {
                     // Diagonal must be 1.0
@@ -438,7 +473,7 @@ impl CorrelationMatrix {
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, cell) in row.iter_mut().enumerate() {
                 let idx = Self::index_for(i, j, n);
-                *cell = self.correlations[idx];
+                *cell = self.correlations.get(idx).copied().unwrap_or(Decimal::ZERO);
             }
         }
 
@@ -529,15 +564,27 @@ impl PortfolioPosition {
     }
 
     /// Returns the total absolute position (sum of |position|).
-    #[must_use]
-    pub fn total_absolute_position(&self) -> Decimal {
-        self.positions.values().map(|p| p.abs()).sum()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the sum overflows.
+    pub fn total_absolute_position(&self) -> MMResult<Decimal> {
+        self.positions
+            .values()
+            .try_fold(Decimal::ZERO, |acc, p| acc.checked_add(p.abs()))
+            .or_overflow("total absolute position")
     }
 
     /// Returns the net position (sum of positions).
-    #[must_use]
-    pub fn net_position(&self) -> Decimal {
-        self.positions.values().copied().sum()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the sum overflows.
+    pub fn net_position(&self) -> MMResult<Decimal> {
+        self.positions
+            .values()
+            .try_fold(Decimal::ZERO, |acc, p| acc.checked_add(*p))
+            .or_overflow("net position")
     }
 }
 
@@ -621,7 +668,13 @@ impl PortfolioRiskCalculator {
                         }
                     });
 
-                variance += pos_i * pos_j * vol_i * vol_j * correlation;
+                variance = pos_i
+                    .checked_mul(pos_j)
+                    .and_then(|x| x.checked_mul(vol_i))
+                    .and_then(|x| x.checked_mul(vol_j))
+                    .and_then(|x| x.checked_mul(correlation))
+                    .and_then(|x| variance.checked_add(x))
+                    .or_overflow("portfolio variance")?;
             }
         }
 
@@ -666,22 +719,25 @@ impl PortfolioRiskCalculator {
         // Scale by time horizon
         let horizon_factor = decimal_sqrt(Decimal::from(horizon_days))?;
 
-        Ok(z_score * volatility * horizon_factor)
+        z_score
+            .checked_mul(volatility)
+            .and_then(|x| x.checked_mul(horizon_factor))
+            .or_overflow("portfolio var")
     }
 
     /// Converts confidence level to z-score.
     fn confidence_to_z_score(&self, confidence: Decimal) -> Decimal {
         // Common z-scores for standard confidence levels
-        let conf_90 = Decimal::from_str_exact("0.90").unwrap();
-        let conf_95 = Decimal::from_str_exact("0.95").unwrap();
-        let conf_99 = Decimal::from_str_exact("0.99").unwrap();
+        let conf_90 = dec!(0.90);
+        let conf_95 = dec!(0.95);
+        let conf_99 = dec!(0.99);
 
         if confidence >= conf_99 {
-            Decimal::from_str_exact("2.326").unwrap() // 99%
+            dec!(2.326) // 99%
         } else if confidence >= conf_95 {
-            Decimal::from_str_exact("1.645").unwrap() // 95%
+            dec!(1.645) // 95%
         } else if confidence >= conf_90 {
-            Decimal::from_str_exact("1.282").unwrap() // 90%
+            dec!(1.282) // 90%
         } else {
             Decimal::ONE // Default
         }
@@ -732,11 +788,19 @@ impl PortfolioRiskCalculator {
                         }
                     });
 
-                cov_contribution += pos_j * vol_i * vol_j * correlation;
+                cov_contribution = pos_j
+                    .checked_mul(vol_i)
+                    .and_then(|x| x.checked_mul(vol_j))
+                    .and_then(|x| x.checked_mul(correlation))
+                    .and_then(|x| cov_contribution.checked_add(x))
+                    .or_overflow("covariance contribution")?;
             }
 
             // Marginal contribution = (cov_contribution / portfolio_vol) * pos_i
-            let marginal = (cov_contribution / portfolio_vol) * pos_i;
+            let marginal = cov_contribution
+                .checked_div(portfolio_vol)
+                .and_then(|x| x.checked_mul(pos_i))
+                .or_overflow("marginal risk contribution")?;
             contributions.insert(asset_i.clone(), marginal);
         }
 
@@ -755,17 +819,16 @@ impl PortfolioRiskCalculator {
             return Ok(Decimal::ONE);
         }
 
-        let weighted_vol_sum: Decimal = portfolio
+        portfolio
             .assets()
             .iter()
-            .map(|asset| {
+            .try_fold(Decimal::ZERO, |acc, asset| {
                 let pos = portfolio.get_position(asset).unwrap_or(Decimal::ZERO);
                 let vol = portfolio.get_volatility(asset).unwrap_or(Decimal::ZERO);
-                pos.abs() * vol
+                pos.abs().checked_mul(vol).and_then(|x| acc.checked_add(x))
             })
-            .sum();
-
-        Ok(weighted_vol_sum / portfolio_vol)
+            .and_then(|sum| sum.checked_div(portfolio_vol))
+            .or_overflow("diversification ratio")
     }
 }
 
@@ -842,9 +905,7 @@ impl HedgeCalculator {
 
         // β = -ρ × (σ_target / σ_hedge)
         // Negative because hedge should be opposite direction
-        let ratio = -correlation * (target_vol / hedge_vol);
-
-        Ok(ratio)
+        hedge_ratio(correlation, target_vol, hedge_vol).or_overflow("hedge ratio")
     }
 
     /// Finds the best hedge asset from available options.
@@ -889,11 +950,11 @@ impl HedgeCalculator {
 
             match &best {
                 None => {
-                    let ratio = -correlation * (*target_vol / *hedge_vol);
+                    let ratio = hedge_ratio(correlation, *target_vol, *hedge_vol)?;
                     best = Some((hedge_asset.clone(), abs_corr, ratio));
                 }
                 Some((_, best_corr, _)) if abs_corr > *best_corr => {
-                    let ratio = -correlation * (*target_vol / *hedge_vol);
+                    let ratio = hedge_ratio(correlation, *target_vol, *hedge_vol)?;
                     best = Some((hedge_asset.clone(), abs_corr, ratio));
                 }
                 _ => {}
@@ -922,21 +983,81 @@ impl HedgeCalculator {
                 ))
             })?;
 
-        let one_minus_rho_sq = Decimal::ONE - correlation * correlation;
+        let one_minus_rho_sq = correlation
+            .checked_mul(correlation)
+            .and_then(|sq| Decimal::ONE.checked_sub(sq))
+            .or_overflow("residual variance factor")?;
 
         if one_minus_rho_sq <= Decimal::ZERO {
             return Ok(Decimal::ZERO); // Perfect hedge
         }
 
         let residual_factor = decimal_sqrt(one_minus_rho_sq)?;
-        Ok(target_vol * residual_factor)
+        target_vol
+            .checked_mul(residual_factor)
+            .or_overflow("residual risk")
     }
+}
+
+/// `-ρ × (σ_target / σ_hedge)`, or `None` on overflow or a zero hedge
+/// volatility.
+fn hedge_ratio(correlation: Decimal, target_vol: Decimal, hedge_vol: Decimal) -> Option<Decimal> {
+    Decimal::ZERO
+        .checked_sub(correlation)?
+        .checked_mul(target_vol.checked_div(hedge_vol)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[test]
+    fn test_portfolio_position_sums_overflow_returns_numerical_error() {
+        let mut portfolio = PortfolioPosition::new();
+        portfolio.set_position(AssetId::new("A"), Decimal::MAX, dec!(1));
+        portfolio.set_position(AssetId::new("B"), Decimal::MAX, dec!(1));
+        assert!(matches!(
+            portfolio.total_absolute_position(),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            portfolio.net_position(),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
+    fn test_portfolio_variance_overflow_returns_numerical_error() {
+        let a = AssetId::new("A");
+        let matrix = CorrelationMatrix::new(vec![a.clone()]);
+        let mut portfolio = PortfolioPosition::new();
+        portfolio.set_position(a, Decimal::MAX, dec!(2));
+        let calculator = PortfolioRiskCalculator::new(matrix);
+        let result = calculator.portfolio_variance(&portfolio);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_correlation_overflow_returns_numerical_error() {
+        let x = [Decimal::MAX, Decimal::MAX];
+        let y = [dec!(1), dec!(2)];
+        let result = CorrelationMatrix::calculate_correlation(&x, &y);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hedge_ratio_overflow() {
+        assert_eq!(hedge_ratio(dec!(1), Decimal::MAX, dec!(0.5)), None);
+        assert_eq!(hedge_ratio(dec!(1), dec!(1), Decimal::ZERO), None);
+        assert_eq!(hedge_ratio(dec!(0.5), dec!(2), dec!(1)), Some(dec!(-1)));
+    }
 
     // AssetId tests
     #[test]
@@ -1101,8 +1222,8 @@ mod tests {
         portfolio.set_position(AssetId::new("BTC"), dec!(1.0), dec!(0.05));
         portfolio.set_position(AssetId::new("ETH"), dec!(-2.0), dec!(0.08));
 
-        assert_eq!(portfolio.total_absolute_position(), dec!(3.0));
-        assert_eq!(portfolio.net_position(), dec!(-1.0));
+        assert_eq!(portfolio.total_absolute_position().unwrap(), dec!(3.0));
+        assert_eq!(portfolio.net_position().unwrap(), dec!(-1.0));
     }
 
     // PortfolioRiskCalculator tests

@@ -3,6 +3,10 @@
 CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 
 
+# Minimum supported Rust version; keep in sync with `rust-version` in
+# Cargo.toml.
+MSRV := 1.95
+
 # Default target
 .PHONY: all
 all: test fmt lint build
@@ -16,10 +20,12 @@ build:
 release:
 	cargo build --release
 
-# Run tests
+# Run tests: the default features, then all of them, since the tests of a
+# feature-gated module only compile with its feature.
 .PHONY: test
 test:
 	LOGLEVEL=WARN cargo test
+	LOGLEVEL=WARN cargo test --all-features
 
 # Format the code
 .PHONY: fmt
@@ -35,6 +41,7 @@ fmt-check:
 .PHONY: lint
 lint:
 	cargo clippy --all-targets --all-features --workspace -- -D warnings
+	cargo clippy --all-targets --no-default-features --workspace -- -D warnings
 
 .PHONY: lint-fix
 lint-fix: 
@@ -59,11 +66,20 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc
+pre-push: fix fmt lint-fix lint test readme doc msrv
+
+# Check the crate with the minimum supported Rust version, with no features
+# and with all features, against the existing lockfile.
+.PHONY: msrv
+msrv:
+	cargo +$(MSRV) check --locked --all-targets --no-default-features
+	cargo +$(MSRV) check --locked --all-targets --all-features
 
 .PHONY: doc
 doc:
 	cargo clippy -- -W missing-docs
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 .PHONY: doc-open
 doc-open:
@@ -78,16 +94,16 @@ publish: readme
 .PHONY: coverage
 coverage:
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	cargo tarpaulin --verbose --all-features --workspace --timeout 0 --out Xml --output-dir coverage
+	cargo tarpaulin --engine llvm --verbose --all-features --workspace --timeout 600 --out Xml --output-dir coverage
 
 .PHONY: coverage-html
 coverage-html:
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	cargo tarpaulin --color Always --engine llvm --tests --all-targets --all-features --workspace --timeout 0 --out Html --output-dir coverage
+	cargo tarpaulin --color Always --engine llvm --tests --all-targets --all-features --workspace --timeout 600 --out Html --output-dir coverage
 
 .PHONY: open-coverage
 open-coverage:

@@ -26,6 +26,7 @@
 //! ```
 
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,8 +36,9 @@ use crate::types::error::{MMError, MMResult};
 
 use super::connector::{
     BookLevel, ExchangeConnector, Fill, MarketDataStream, OrderBookSnapshot, OrderId, OrderRequest,
-    OrderResponse, OrderStatus, Side,
+    OrderResponse, OrderStatus,
 };
+use crate::types::action::{Action, Dir};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,11 @@ pub struct MockConfig {
     pub spread: Decimal,
 }
 
+/// Maps a poisoned lock to [`MMError::LockPoisoned`].
+fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
+    MMError::LockPoisoned("mock connector".to_string())
+}
+
 impl Default for MockConfig {
     fn default() -> Self {
         let mut balances = HashMap::new();
@@ -86,7 +93,7 @@ impl Default for MockConfig {
             initial_balances: balances,
             default_depth: 10,
             base_price: Decimal::from(50_000),
-            spread: Decimal::from_str_exact("0.001").unwrap(),
+            spread: dec!(0.001),
         }
     }
 }
@@ -176,6 +183,8 @@ pub struct MockExchangeConnector {
     balances: RwLock<HashMap<String, Decimal>>,
     order_counter: AtomicU64,
     current_time: AtomicU64,
+    /// The symbol of the last trade subscription, which simulated trades name.
+    trade_symbol: RwLock<Option<String>>,
 }
 
 impl MockExchangeConnector {
@@ -193,6 +202,7 @@ impl MockExchangeConnector {
             balances,
             order_counter: AtomicU64::new(1),
             current_time: AtomicU64::new(1_000_000),
+            trade_symbol: RwLock::new(None),
         }
     }
 
@@ -225,9 +235,13 @@ impl MockExchangeConnector {
     }
 
     /// Sets the balance for an asset.
-    pub fn set_balance(&self, asset: &str, balance: Decimal) {
-        let mut balances = self.balances.write().unwrap();
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn set_balance(&self, asset: &str, balance: Decimal) -> MMResult<()> {
+        let mut balances = self.balances.write().map_err(poisoned)?;
         balances.insert(asset.to_string(), balance);
+        Ok(())
     }
 
     /// Generates a new unique order ID.
@@ -250,36 +264,46 @@ impl MockExchangeConnector {
         if self.config.failure_rate > 0.0 {
             // Simple deterministic "random" based on order counter
             let counter = self.order_counter.load(Ordering::SeqCst);
-            let threshold = (self.config.failure_rate * 100.0) as u64;
-            counter % 100 < threshold
+            // `bucket < trunc(rate * 100)` is `bucket + 1 <= rate * 100`
+            // for an integer bucket, without a float to int cast.
+            let bucket = u8::try_from(counter % 100).unwrap_or(u8::MAX);
+            f64::from(bucket) + 1.0 <= self.config.failure_rate * 100.0
         } else {
             false
         }
     }
 
     /// Generates a simulated order book.
+    ///
+    /// A synthetic book for tests: its prices and sizes saturate at the
+    /// `Decimal` bounds for extreme configurations.
     fn generate_orderbook(&self, symbol: &str, depth: usize) -> OrderBookSnapshot {
         let base_price = self.config.base_price;
-        let half_spread = base_price * self.config.spread / Decimal::from(2);
+        let half_spread = base_price
+            .saturating_mul(self.config.spread)
+            .saturating_mul(dec!(0.5));
 
         let mut bids = Vec::with_capacity(depth);
         let mut asks = Vec::with_capacity(depth);
 
-        let tick_size = base_price * Decimal::from_str_exact("0.0001").unwrap();
+        let tick_size = base_price.saturating_mul(dec!(0.0001));
 
         for i in 0..depth {
-            let offset = tick_size * Decimal::from(i);
+            let offset = tick_size.saturating_mul(Decimal::from(i));
+            let qty = Decimal::ONE.saturating_add(Decimal::from(i).saturating_mul(dec!(0.5)));
 
             // Bid prices descending from mid - half_spread
-            let bid_price = base_price - half_spread - offset;
-            let bid_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let bid_price = base_price
+                .saturating_sub(half_spread)
+                .saturating_sub(offset);
+            let bid_qty = qty;
             bids.push(BookLevel::new(bid_price, bid_qty));
 
             // Ask prices ascending from mid + half_spread
-            let ask_price = base_price + half_spread + offset;
-            let ask_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let ask_price = base_price
+                .saturating_add(half_spread)
+                .saturating_add(offset);
+            let ask_qty = qty;
             asks.push(BookLevel::new(ask_price, ask_qty));
         }
 
@@ -292,12 +316,12 @@ impl MockExchangeConnector {
     }
 
     /// Simulates a fill for a market order.
-    fn simulate_market_fill(&self, request: &OrderRequest) -> (OrderStatus, Decimal) {
+    fn simulate_market_fill(&self, request: &OrderRequest, dir: Dir) -> (OrderStatus, Decimal) {
         let orderbook = self.generate_orderbook(&request.symbol, 1);
 
-        let fill_price = match request.side {
-            Side::Buy => orderbook.best_ask().unwrap_or(self.config.base_price),
-            Side::Sell => orderbook.best_bid().unwrap_or(self.config.base_price),
+        let fill_price = match dir {
+            Dir::Buy => orderbook.best_ask().unwrap_or(self.config.base_price),
+            Dir::Sell => orderbook.best_bid().unwrap_or(self.config.base_price),
         };
 
         let status = OrderStatus::Filled {
@@ -309,23 +333,29 @@ impl MockExchangeConnector {
     }
 
     /// Gets the number of open orders.
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
-        let orders = self.orders.read().unwrap();
-        orders.values().filter(|o| o.status.is_open()).count()
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn open_order_count(&self) -> MMResult<usize> {
+        let orders = self.orders.read().map_err(poisoned)?;
+        Ok(orders.values().filter(|o| o.status.is_open()).count())
     }
 
     /// Gets all order IDs.
-    #[must_use]
-    pub fn all_order_ids(&self) -> Vec<OrderId> {
-        let orders = self.orders.read().unwrap();
-        orders.values().map(|o| o.order_id.clone()).collect()
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn all_order_ids(&self) -> MMResult<Vec<OrderId>> {
+        let orders = self.orders.read().map_err(poisoned)?;
+        Ok(orders.values().map(|o| o.order_id.clone()).collect())
     }
 }
 
 #[async_trait]
 impl ExchangeConnector for MockExchangeConnector {
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse> {
+        // Validated before any simulated latency, failure or id allocation.
+        let dir = Dir::try_from(request.side)?;
         self.simulate_latency().await;
 
         if self.should_fail() {
@@ -338,7 +368,7 @@ impl ExchangeConnector for MockExchangeConnector {
         let timestamp = self.current_time();
 
         let status = if request.order_type.is_market() {
-            let (status, _) = self.simulate_market_fill(&request);
+            let (status, _) = self.simulate_market_fill(&request, dir);
             status
         } else {
             OrderStatus::Open {
@@ -354,7 +384,7 @@ impl ExchangeConnector for MockExchangeConnector {
         };
 
         {
-            let mut orders = self.orders.write().unwrap();
+            let mut orders = self.orders.write().map_err(poisoned)?;
             orders.insert(order_id.as_str().to_string(), state);
         }
 
@@ -375,7 +405,7 @@ impl ExchangeConnector for MockExchangeConnector {
             ));
         }
 
-        let mut orders = self.orders.write().unwrap();
+        let mut orders = self.orders.write().map_err(poisoned)?;
         let state = orders
             .get_mut(order_id.as_str())
             .ok_or_else(|| MMError::InvalidMarketState(format!("order not found: {}", order_id)))?;
@@ -411,7 +441,7 @@ impl ExchangeConnector for MockExchangeConnector {
 
         // Get the original request
         let original_request = {
-            let orders = self.orders.read().unwrap();
+            let orders = self.orders.read().map_err(poisoned)?;
             let state = orders.get(order_id.as_str()).ok_or_else(|| {
                 MMError::InvalidMarketState(format!("order not found: {}", order_id))
             })?;
@@ -437,7 +467,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_order_status(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         self.simulate_latency().await;
 
-        let orders = self.orders.read().unwrap();
+        let orders = self.orders.read().map_err(poisoned)?;
         let state = orders
             .get(order_id.as_str())
             .ok_or_else(|| MMError::InvalidMarketState(format!("order not found: {}", order_id)))?;
@@ -453,7 +483,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_open_orders(&self, symbol: &str) -> MMResult<Vec<OrderResponse>> {
         self.simulate_latency().await;
 
-        let orders = self.orders.read().unwrap();
+        let orders = self.orders.read().map_err(poisoned)?;
         let open_orders: Vec<OrderResponse> = orders
             .values()
             .filter(|state| state.request.symbol == symbol && state.status.is_open())
@@ -472,7 +502,7 @@ impl ExchangeConnector for MockExchangeConnector {
         self.simulate_latency().await;
 
         let order_ids: Vec<OrderId> = {
-            let orders = self.orders.read().unwrap();
+            let orders = self.orders.read().map_err(poisoned)?;
             orders
                 .values()
                 .filter(|state| state.request.symbol == symbol && state.status.is_open())
@@ -481,13 +511,22 @@ impl ExchangeConnector for MockExchangeConnector {
         };
 
         let mut responses = Vec::new();
+        let mut first_error = None;
         for order_id in order_ids {
-            if let Ok(response) = self.cancel_order(&order_id).await {
-                responses.push(response);
+            match self.cancel_order(&order_id).await {
+                Ok(response) => responses.push(response),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        Ok(responses)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(responses),
+        }
     }
 
     async fn get_orderbook(&self, symbol: &str, depth: usize) -> MMResult<OrderBookSnapshot> {
@@ -505,7 +544,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_balance(&self, asset: &str) -> MMResult<Decimal> {
         self.simulate_latency().await;
 
-        let balances = self.balances.read().unwrap();
+        let balances = self.balances.read().map_err(poisoned)?;
         Ok(*balances.get(asset).unwrap_or(&Decimal::ZERO))
     }
 }
@@ -517,8 +556,19 @@ impl MarketDataStream for MockExchangeConnector {
         Ok(())
     }
 
-    async fn subscribe_trades(&self, _symbol: &str) -> MMResult<()> {
-        // Mock implementation - always succeeds
+    /// Simulated trades name `symbol`; a later subscription replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] for an empty symbol, and
+    /// [`MMError::LockPoisoned`] if the lock is poisoned.
+    async fn subscribe_trades(&self, symbol: &str) -> MMResult<()> {
+        if symbol.is_empty() {
+            return Err(MMError::InvalidConfiguration(
+                "cannot subscribe to the trades of an empty symbol".to_string(),
+            ));
+        }
+        *self.trade_symbol.write().map_err(poisoned)? = Some(symbol.to_string());
         Ok(())
     }
 
@@ -527,16 +577,33 @@ impl MarketDataStream for MockExchangeConnector {
         Ok(self.generate_orderbook("BTC-USD", self.config.default_depth))
     }
 
+    /// A simulated trade of the subscribed symbol.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] without a trade subscription, since the
+    /// trade would have no instrument to name, and [`MMError::LockPoisoned`] if
+    /// the lock is poisoned.
     async fn next_trade(&self) -> MMResult<Fill> {
-        // Return a simulated trade
+        let symbol = self
+            .trade_symbol
+            .read()
+            .map_err(poisoned)?
+            .clone()
+            .ok_or_else(|| {
+                MMError::InvalidConfiguration(
+                    "no trade subscription: subscribe_trades first".to_string(),
+                )
+            })?;
         Ok(Fill {
+            symbol,
             order_id: OrderId::new("mock-trade"),
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,
-            quantity: Decimal::from_str_exact("0.1").unwrap(),
-            side: Side::Buy,
+            quantity: dec!(0.1),
+            side: Action::Buy,
             timestamp: self.current_time(),
-            fee: Decimal::from_str_exact("0.001").unwrap(),
+            fee: dec!(0.001),
             fee_currency: "USD".to_string(),
         })
     }
@@ -546,6 +613,36 @@ impl MarketDataStream for MockExchangeConnector {
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[tokio::test]
+    async fn test_next_trade_names_the_subscribed_symbol() {
+        let connector = MockExchangeConnector::with_defaults();
+        connector.subscribe_trades("ETH-USD").await.unwrap();
+        assert_eq!(connector.next_trade().await.unwrap().symbol, "ETH-USD");
+        // A later subscription replaces it.
+        connector.subscribe_trades("SOL-USD").await.unwrap();
+        assert_eq!(connector.next_trade().await.unwrap().symbol, "SOL-USD");
+    }
+
+    #[tokio::test]
+    async fn test_next_trade_without_a_subscription_names_nothing() {
+        let connector = MockExchangeConnector::with_defaults();
+        assert!(matches!(
+            connector.next_trade().await,
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_trades_refuses_an_empty_symbol() {
+        let connector = MockExchangeConnector::with_defaults();
+        assert!(matches!(
+            connector.subscribe_trades("").await,
+            Err(MMError::InvalidConfiguration(_))
+        ));
+        // And the refusal subscribed nothing.
+        assert!(connector.next_trade().await.is_err());
+    }
 
     #[tokio::test]
     async fn test_submit_limit_order() {
@@ -668,6 +765,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_all_orders_reports_failed_cancels() {
+        let mut connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        connector
+            .submit_order(OrderRequest::limit_sell(
+                "BTC-USD",
+                dec!(51000.0),
+                dec!(0.1),
+            ))
+            .await
+            .unwrap();
+        // Every later exchange call fails.
+        connector.config.failure_rate = 1.0;
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::InvalidMarketState(_)), "{error}");
+        // Nothing was cancelled, so both orders are still open.
+        assert_eq!(connector.get_open_orders("BTC-USD").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_poisoned_lock() {
+        let connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = connector.orders.write().unwrap();
+                panic!("poison the order table");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::LockPoisoned(_)), "{error}");
+    }
+
+    #[tokio::test]
     async fn test_modify_order() {
         let connector = MockExchangeConnector::with_defaults();
 
@@ -715,7 +855,7 @@ mod tests {
     async fn test_set_balance() {
         let connector = MockExchangeConnector::with_defaults();
 
-        connector.set_balance("ETH", dec!(100.0));
+        connector.set_balance("ETH", dec!(100.0)).unwrap();
         let balance = connector.get_balance("ETH").await.unwrap();
         assert_eq!(balance, dec!(100.0));
     }
@@ -779,14 +919,14 @@ mod tests {
     async fn test_open_order_count() {
         let connector = MockExchangeConnector::with_defaults();
 
-        assert_eq!(connector.open_order_count(), 0);
+        assert_eq!(connector.open_order_count().unwrap(), 0);
 
         connector
             .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
             .await
             .unwrap();
 
-        assert_eq!(connector.open_order_count(), 1);
+        assert_eq!(connector.open_order_count().unwrap(), 1);
 
         connector
             .submit_order(OrderRequest::market_buy("BTC-USD", dec!(0.1)))
@@ -794,6 +934,34 @@ mod tests {
             .unwrap();
 
         // Market order is filled immediately, so still 1 open
-        assert_eq!(connector.open_order_count(), 1);
+        assert_eq!(connector.open_order_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_unsupported_action_returns_err_without_effects() {
+        let connector = MockExchangeConnector::with_defaults();
+        let fresh = MockExchangeConnector::with_defaults();
+
+        let mut request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1));
+        request.side = Action::Other;
+        assert_eq!(
+            connector.submit_order(request).await,
+            Err(MMError::UnsupportedAction {
+                action: Action::Other
+            })
+        );
+        assert!(
+            connector
+                .get_open_orders("BTC-USD")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // No order id was consumed.
+        let valid = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1));
+        let first = connector.submit_order(valid.clone()).await.unwrap();
+        let expected = fresh.submit_order(valid).await.unwrap();
+        assert_eq!(first.order_id, expected.order_id);
     }
 }

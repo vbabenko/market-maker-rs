@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::types::action::Action;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +68,88 @@ pub enum MMError {
     /// such as failed connections, timeouts, or disconnections.
     #[error("connection error: {0}")]
     ConnectionError(String) = 6,
+
+    /// Unsupported trade direction.
+    ///
+    /// This error occurs when an order, fill or query carries an
+    /// [`Action`] other than [`Action::Buy`] or [`Action::Sell`], for example
+    /// [`Action::Other`]. It is returned before any state changes, except
+    /// that a pretrade policy receiving such a fill also latches a fault.
+    #[error("unsupported action {action}: only buy and sell are supported")]
+    UnsupportedAction {
+        /// The action given.
+        action: Action,
+    } = 7,
+
+    /// A lock guarding shared state was poisoned.
+    ///
+    /// This error occurs when another thread panicked while holding the
+    /// lock, so the protected state may be inconsistent.
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String) = 8,
+
+    /// The contract cannot be valued by the model asked for.
+    ///
+    /// This error occurs when an option has an exercise style or a payoff
+    /// the pricer does not support (for example an American or an exotic
+    /// option given to the European Black-Scholes-Merton pricer). It is
+    /// never replaced by an approximate value.
+    #[error("unsupported contract: {reason}")]
+    UnsupportedContract {
+        /// Why the contract is not supported.
+        reason: String,
+    } = 9,
+
+    /// A price whose true value is positive is below the smallest positive
+    /// `f64` (about 4.9e-324), so it cannot be represented.
+    ///
+    /// Returned by `options::pricing::black_undiscounted` (feature `options`)
+    /// for `w > 0`, where the Black price is strictly positive. It is never
+    /// replaced by 0; an implied volatility solver can treat it as "below
+    /// the representable range" and must propagate every other error. It is
+    /// a numerical limit: [`MMError::is_numerical_error`] is true for it.
+    #[error("numerical error: {}", PRICE_UNDERFLOW_MESSAGE)]
+    PriceUnderflow = 10,
+
+    /// A fill was not booked: this call left the Greeks unchanged, so they
+    /// miss it.
+    ///
+    /// The risk manager stays fail closed until an explicit reset or
+    /// reconciliation. Booking the fill again cannot count this call twice,
+    /// because it applied nothing. That is all it promises: the next attempt
+    /// may fail too, and one that succeeds does not recover the manager,
+    /// because nothing proves which fill it was. The message carries the cause.
+    #[error("fill not booked, the Greeks miss it: {0}")]
+    FillNotBooked(String) = 11,
+
+    /// A fill was booked, but the risk check after it failed.
+    ///
+    /// The Greeks include the fill: booking it again counts it twice. The
+    /// message carries the cause.
+    #[error("fill booked, but the risk check after it failed: {0}")]
+    FillBookedCheckFailed(String) = 12,
+
+    /// An answer was asked from Greeks known to miss a fill that could not be
+    /// booked ([`MMError::FillNotBooked`]).
+    ///
+    /// It lasts until the risk manager is explicitly reset or reconciled.
+    #[error("{}", GREEKS_MISS_FILL_MESSAGE)]
+    GreeksMissFill = 13,
+
+    /// The chain risk status does not allow quoting, so no quote was produced.
+    ///
+    /// Any quote resting from an earlier refresh should be withdrawn. Retrying
+    /// does not help until the status changes, and none of the `is_*` helpers
+    /// is true for it. The message carries the status.
+    #[error("quoting halted: {0}")]
+    QuotingHalted(String) = 14,
 }
+
+/// The message of [`MMError::PriceUnderflow`].
+const PRICE_UNDERFLOW_MESSAGE: &str = "Black price is positive but below the smallest positive f64";
+
+/// The message of [`MMError::GreeksMissFill`].
+const GREEKS_MISS_FILL_MESSAGE: &str = "the Greeks miss a fill that could not be booked";
 
 impl MMError {
     /// Returns true if this error is related to configuration issues.
@@ -81,10 +164,11 @@ impl MMError {
         matches!(self, Self::InvalidMarketState(_))
     }
 
-    /// Returns true if this error is related to numerical issues.
+    /// Returns true if this error is related to numerical issues:
+    /// [`MMError::NumericalError`] and [`MMError::PriceUnderflow`].
     #[must_use]
     pub fn is_numerical_error(&self) -> bool {
-        matches!(self, Self::NumericalError(_))
+        matches!(self, Self::NumericalError(_) | Self::PriceUnderflow)
     }
 
     /// Returns true if this error is related to connection issues.
@@ -103,7 +187,15 @@ impl MMError {
             | Self::InvalidPositionUpdate(msg)
             | Self::InvalidQuoteGeneration(msg)
             | Self::InvalidTimestamp(msg)
-            | Self::ConnectionError(msg) => msg,
+            | Self::ConnectionError(msg)
+            | Self::LockPoisoned(msg)
+            | Self::FillNotBooked(msg)
+            | Self::FillBookedCheckFailed(msg)
+            | Self::QuotingHalted(msg) => msg,
+            Self::UnsupportedContract { reason } => reason,
+            Self::UnsupportedAction { .. } => "only buy and sell are supported",
+            Self::PriceUnderflow => PRICE_UNDERFLOW_MESSAGE,
+            Self::GreeksMissFill => GREEKS_MISS_FILL_MESSAGE,
         }
     }
 }
@@ -117,6 +209,7 @@ pub type Result<T> = MMResult<T>;
 #[cfg(test)]
 mod tests {
     use super::super::error::{MMError, MMResult};
+    use crate::types::action::Action;
 
     #[test]
     fn test_error_creation() {
@@ -140,6 +233,12 @@ mod tests {
         assert!(!num_err.is_configuration_error());
         assert!(!num_err.is_market_state_error());
         assert!(num_err.is_numerical_error());
+
+        let halted = MMError::QuotingHalted("Breached".to_string());
+        assert!(!halted.is_configuration_error());
+        assert!(!halted.is_market_state_error());
+        assert!(!halted.is_numerical_error());
+        assert!(!halted.is_connection_error());
     }
 
     #[test]
@@ -207,6 +306,10 @@ mod tests {
             MMError::InvalidConfiguration("test".to_string()),
             MMError::InvalidMarketState("test".to_string()),
             MMError::NumericalError("test".to_string()),
+            MMError::FillNotBooked("test".to_string()),
+            MMError::FillBookedCheckFailed("test".to_string()),
+            MMError::GreeksMissFill,
+            MMError::QuotingHalted("test".to_string()),
             MMError::InvalidPositionUpdate("test".to_string()),
             MMError::InvalidQuoteGeneration("test".to_string()),
             MMError::InvalidTimestamp("test".to_string()),
@@ -217,5 +320,63 @@ mod tests {
             let deserialized: MMError = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, err);
         }
+    }
+
+    #[test]
+    fn test_unsupported_action_display_and_message() {
+        let err = MMError::UnsupportedAction {
+            action: Action::Other,
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported action Other: only buy and sell are supported"
+        );
+        assert_eq!(err.message(), "only buy and sell are supported");
+        assert!(!err.is_configuration_error());
+        assert!(!err.is_market_state_error());
+        assert!(!err.is_numerical_error());
+        assert!(!err.is_connection_error());
+    }
+
+    #[test]
+    fn test_price_underflow_display_message_and_class() {
+        let err = MMError::PriceUnderflow;
+        assert_eq!(
+            err.to_string(),
+            "numerical error: Black price is positive but below the smallest positive f64"
+        );
+        assert_eq!(
+            err.message(),
+            "Black price is positive but below the smallest positive f64"
+        );
+        assert!(err.is_numerical_error());
+        assert!(!err.is_configuration_error());
+        assert!(!err.is_market_state_error());
+        assert!(!err.is_connection_error());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_price_underflow_serialization() {
+        let err = MMError::PriceUnderflow;
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, r#"{"type":"PriceUnderflow"}"#);
+        let deserialized: MMError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, err);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_unsupported_action_serialization() {
+        let err = MMError::UnsupportedAction {
+            action: Action::Other,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"UnsupportedAction","details":{"action":"Other"}}"#
+        );
+        let deserialized: MMError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, err);
     }
 }

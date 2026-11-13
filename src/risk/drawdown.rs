@@ -190,7 +190,7 @@ impl DrawdownTracker {
             self.peak_timestamp = timestamp;
         } else if self.peak_equity > Decimal::ZERO {
             // Calculate current drawdown
-            let drawdown = (self.peak_equity - equity) / self.peak_equity;
+            let drawdown = drawdown_from(self.peak_equity, equity);
 
             // Update max historical drawdown
             if drawdown > self.max_historical_drawdown {
@@ -241,8 +241,7 @@ impl DrawdownTracker {
             return Decimal::ZERO;
         }
 
-        let drawdown = (self.peak_equity - self.current_equity) / self.peak_equity;
-        drawdown.max(Decimal::ZERO)
+        drawdown_from(self.peak_equity, self.current_equity).max(Decimal::ZERO)
     }
 
     /// Returns the current drawdown as a percentage (0.0 to 100.0).
@@ -259,7 +258,9 @@ impl DrawdownTracker {
     /// ```
     #[must_use]
     pub fn current_drawdown_pct(&self) -> Decimal {
-        self.current_drawdown() * Decimal::ONE_HUNDRED
+        // Saturates like `current_drawdown`: an unrepresentable drawdown
+        // reads as `Decimal::MAX`.
+        self.current_drawdown().saturating_mul(Decimal::ONE_HUNDRED)
     }
 
     /// Checks if the maximum allowed drawdown has been reached or exceeded.
@@ -354,9 +355,13 @@ impl DrawdownTracker {
     /// // 10% remaining before hitting 20% limit
     /// assert_eq!(tracker.distance_to_max_drawdown(), dec!(0.10));
     /// ```
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn distance_to_max_drawdown(&self) -> Decimal {
-        let distance = self.max_allowed_drawdown - self.current_drawdown();
+        let distance = self
+            .max_allowed_drawdown
+            .saturating_sub(self.current_drawdown());
         distance.max(Decimal::ZERO)
     }
 
@@ -374,9 +379,12 @@ impl DrawdownTracker {
     /// // 20% drawdown from 12000 = 9600
     /// assert_eq!(tracker.equity_at_max_drawdown(), dec!(9600.0));
     /// ```
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn equity_at_max_drawdown(&self) -> Decimal {
-        self.peak_equity * (Decimal::ONE - self.max_allowed_drawdown)
+        self.peak_equity
+            .saturating_mul(Decimal::ONE.saturating_sub(self.max_allowed_drawdown))
     }
 
     /// Resets the tracker with new equity.
@@ -423,9 +431,57 @@ impl DrawdownTracker {
     }
 }
 
+/// Relative drawdown `(peak - equity) / peak` for a positive `peak`,
+/// computed as `1 - equity / peak` so no intermediate is clamped.
+///
+/// Callers cannot return errors, so only a ratio that is itself beyond the
+/// `Decimal` range saturates, with its sign: a huge drawdown reads as
+/// `Decimal::MAX` (which breaches any limit, fail closed) and a huge
+/// negative one as `Decimal::MIN`.
+fn drawdown_from(peak: Decimal, equity: Decimal) -> Decimal {
+    let ratio_overflow = || {
+        // `equity / peak` overflowed or `1 - ratio` did: the sign of the
+        // true ratio is the opposite of the sign of `equity`.
+        if equity.is_sign_negative() {
+            Decimal::MAX
+        } else {
+            Decimal::MIN
+        }
+    };
+    equity
+        .checked_div(peak)
+        .and_then(|ratio| Decimal::ONE.checked_sub(ratio))
+        .unwrap_or_else(ratio_overflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_drawdown_from_huge_values_keeps_ratio_exact() {
+        // `peak - equity` overflows here, but the ratio is representable.
+        let peak = Decimal::MAX;
+        let equity = -Decimal::MAX;
+        assert_eq!(drawdown_from(peak, equity), dec!(2));
+    }
+
+    #[test]
+    fn test_current_drawdown_pct_extreme_loss_saturates() {
+        let mut tracker =
+            DrawdownTracker::new(dec!(0.0000000000000000000000000001), dec!(0.20)).unwrap();
+        tracker.update(Decimal::MIN, 1000);
+        assert_eq!(tracker.current_drawdown_pct(), Decimal::MAX);
+    }
+
+    #[test]
+    fn test_update_extreme_loss_saturates_and_breaches() {
+        let mut tracker =
+            DrawdownTracker::new(dec!(0.0000000000000000000000000001), dec!(0.20)).unwrap();
+        tracker.update(Decimal::MIN, 1000);
+        assert_eq!(tracker.current_drawdown(), Decimal::MAX);
+        assert!(tracker.is_max_drawdown_reached());
+    }
     use crate::dec;
 
     #[test]

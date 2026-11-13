@@ -160,7 +160,8 @@ impl EventHistory {
 
     /// Prunes old events based on retention time.
     pub fn prune(&mut self) {
-        let cutoff = current_timestamp_ms().saturating_sub(self.retention_secs * 1000);
+        let retention_ms = self.retention_secs.saturating_mul(1000);
+        let cutoff = current_timestamp_ms().saturating_sub(retention_ms);
         while let Some(front) = self.events.front() {
             if front.received_at < cutoff {
                 self.events.pop_front();
@@ -419,14 +420,14 @@ impl EventAggregator {
 fn current_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::types::{EventType, Side};
+    use crate::events::types::{Action, EventType};
 
     #[test]
     fn test_config_builder() {
@@ -550,7 +551,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,

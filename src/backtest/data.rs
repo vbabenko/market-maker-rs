@@ -22,6 +22,7 @@
 //! ```
 
 use crate::Decimal;
+use crate::types::decimal::midpoint;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -103,40 +104,52 @@ impl MarketTick {
     }
 
     /// Returns the mid price.
+    ///
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        (self.bid_price + self.ask_price) / Decimal::TWO
+        midpoint(self.bid_price, self.ask_price)
     }
 
     /// Returns the bid-ask spread.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
-        self.ask_price - self.bid_price
+        self.ask_price.saturating_sub(self.bid_price)
     }
 
     /// Returns the spread as a percentage of mid price.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            (self.spread() / mid) * Decimal::from(10000)
+            // An overflow is an extreme spread, never a zero one.
+            crate::types::decimal::saturating_div(self.spread(), mid)
+                .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO
         }
     }
 
     /// Returns the total available liquidity (bid + ask size).
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_liquidity(&self) -> Decimal {
-        self.bid_size + self.ask_size
+        self.bid_size.saturating_add(self.ask_size)
     }
 
     /// Returns the imbalance ratio: (bid_size - ask_size) / (bid_size + ask_size).
+    ///
+    /// Scale invariant: exact even when the sides sum beyond the `Decimal` bounds; zero when there is no liquidity.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
         let total = self.total_liquidity();
         if total > Decimal::ZERO {
-            (self.bid_size - self.ask_size) / total
+            crate::types::decimal::imbalance_ratio(self.bid_size, self.ask_size)
         } else {
             Decimal::ZERO
         }
@@ -202,18 +215,22 @@ impl OHLCVBar {
     }
 
     /// Returns the price range (high - low).
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn range(&self) -> Decimal {
-        self.high - self.low
+        self.high.saturating_sub(self.low)
     }
 
     /// Returns the body size (|close - open|).
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn body(&self) -> Decimal {
         if self.close > self.open {
-            self.close - self.open
+            self.close.saturating_sub(self.open)
         } else {
-            self.open - self.close
+            self.open.saturating_sub(self.close)
         }
     }
 
@@ -230,9 +247,12 @@ impl OHLCVBar {
     }
 
     /// Returns the typical price (high + low + close) / 3.
+    ///
+    /// Overflow safe: the mean stays within the bar's range even when the
+    /// sum is beyond the `Decimal` bounds.
     #[must_use]
     pub fn typical_price(&self) -> Decimal {
-        (self.high + self.low + self.close) / Decimal::from(3)
+        crate::types::decimal::mean3(self.high, self.low, self.close)
     }
 
     /// Returns the VWAP approximation using typical price.
@@ -342,26 +362,18 @@ impl VecDataSource {
     /// Returns the time range of the data.
     #[must_use]
     pub fn time_range(&self) -> Option<(u64, u64)> {
-        if self.ticks.is_empty() {
-            None
-        } else {
-            Some((
-                self.ticks.first().unwrap().timestamp,
-                self.ticks.last().unwrap().timestamp,
-            ))
+        match (self.ticks.first(), self.ticks.last()) {
+            (Some(first), Some(last)) => Some((first.timestamp, last.timestamp)),
+            _ => None,
         }
     }
 }
 
 impl HistoricalDataSource for VecDataSource {
     fn next_tick(&mut self) -> Option<MarketTick> {
-        if self.index < self.ticks.len() {
-            let tick = self.ticks[self.index].clone();
-            self.index += 1;
-            Some(tick)
-        } else {
-            None
-        }
+        let tick = self.ticks.get(self.index)?.clone();
+        self.index = self.index.saturating_add(1);
+        Some(tick)
     }
 
     fn peek_tick(&self) -> Option<&MarketTick> {
@@ -528,6 +540,23 @@ mod tests {
         );
         assert!(!bearish.is_bullish());
         assert!(bearish.is_bearish());
+    }
+
+    #[test]
+    fn test_ohlcv_bar_typical_price_near_the_bounds() {
+        let bar = OHLCVBar::new(
+            0,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MAX,
+            dec!(1),
+        );
+        assert_eq!(bar.typical_price(), Decimal::MAX);
+        assert_eq!(bar.vwap(), Decimal::MAX);
+        let low = Decimal::MAX - dec!(3);
+        let bar = OHLCVBar::new(0, low, Decimal::MAX, low, low, dec!(1));
+        assert_eq!(bar.typical_price(), Decimal::MAX - dec!(2));
     }
 
     #[test]

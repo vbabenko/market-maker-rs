@@ -24,6 +24,21 @@
 //! ```
 //! Where:
 //! - `k`: order intensity parameter
+//!
+//! ### Units
+//! - `s`, `r`, `δ`: price units; `q`: base units, signed (long positive)
+//! - `σ`: **absolute** price volatility in price units per √year (not a
+//!   relative or percentage volatility); for a relative volatility `v`, pass
+//!   `σ = v * s`
+//! - `T - t`: milliseconds, converted to years of 365 days
+//! - `γ` and `k`: 1 / price units
+//! - `ln` and powers are evaluated through `f64`, so accuracy depends on the
+//!   inputs. On the validated fixtures the relative error is around 1e-15.
+//!   It degrades as `γ / k` shrinks, because `1 + γ / k` loses digits when it
+//!   is converted to `f64` before `ln`: at zero horizon with `γ = 1e-10` and
+//!   `k = 1` the spread is off by about 8e-8 relative, and below about 1e-16
+//!   the intensity term collapses to zero and quote generation fails. The
+//!   continuous quotes are not rounded to tick here
 
 use crate::Decimal;
 use crate::types::decimal::{decimal_ln, decimal_powi};
@@ -44,7 +59,7 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 /// * `mid_price` - Current mid-price of the asset
 /// * `inventory` - Current inventory position (positive = long, negative = short)
 /// * `risk_aversion` - Risk aversion parameter (gamma), must be positive
-/// * `volatility` - Volatility estimate (annualized), must be positive
+/// * `volatility` - Absolute price volatility per √year (see module units), must be positive
 /// * `time_to_terminal_ms` - Time remaining until terminal time, in milliseconds
 ///
 /// # Returns
@@ -70,7 +85,7 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 ///     dec!(100.0),  // mid_price
 ///     dec!(10.0),   // inventory (long)
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000       // 1 hour in ms
 /// ).unwrap();
 ///
@@ -103,15 +118,19 @@ pub fn calculate_reservation_price(
         ));
     }
 
-    // Convert time to years (volatility is annualized)
-    let time_to_terminal_ms_dec = Decimal::from(time_to_terminal_ms);
-    let time_to_terminal_years =
-        (time_to_terminal_ms_dec * SECONDS_PER_MILLISECOND) / SECONDS_PER_YEAR;
+    // Convert time to years (volatility is per √year)
+    let time_to_terminal_years = years_to_terminal(time_to_terminal_ms)?;
 
     // Formula: r = s - q * γ * σ² * (T - t)
     let volatility_squared = decimal_powi(volatility, 2)?;
-    let adjustment = inventory * risk_aversion * volatility_squared * time_to_terminal_years;
-    let reservation_price = mid_price - adjustment;
+    let adjustment = checked(
+        inventory
+            .checked_mul(risk_aversion)
+            .and_then(|x| x.checked_mul(volatility_squared))
+            .and_then(|x| x.checked_mul(time_to_terminal_years)),
+        "reservation price adjustment",
+    )?;
+    let reservation_price = checked(mid_price.checked_sub(adjustment), "reservation price")?;
 
     Ok(reservation_price)
 }
@@ -125,9 +144,9 @@ pub fn calculate_reservation_price(
 /// # Arguments
 ///
 /// * `risk_aversion` - Risk aversion parameter (gamma), must be positive
-/// * `volatility` - Volatility estimate (annualized), must be positive
+/// * `volatility` - Absolute price volatility per √year (see module units), must be positive
 /// * `time_to_terminal_ms` - Time remaining until terminal time, in milliseconds
-/// * `order_intensity` - Order intensity parameter (k), must be positive
+/// * `order_intensity` - Order intensity decay `k`, in 1 / price units, must be positive
 ///
 /// # Returns
 ///
@@ -145,7 +164,7 @@ pub fn calculate_reservation_price(
 ///
 /// let spread = calculate_optimal_spread(
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000,      // 1 hour
 ///     dec!(1.5)     // order_intensity
 /// ).unwrap();
@@ -178,21 +197,35 @@ pub fn calculate_optimal_spread(
     }
 
     // Convert time to years
-    let time_to_terminal_ms_dec = Decimal::from(time_to_terminal_ms);
-    let time_to_terminal_years =
-        (time_to_terminal_ms_dec * SECONDS_PER_MILLISECOND) / SECONDS_PER_YEAR;
+    let time_to_terminal_years = years_to_terminal(time_to_terminal_ms)?;
 
     // Formula: δ = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/k)
     let volatility_squared = decimal_powi(volatility, 2)?;
-    let inventory_risk_term = risk_aversion * volatility_squared * time_to_terminal_years;
+    let inventory_risk_term = checked(
+        risk_aversion
+            .checked_mul(volatility_squared)
+            .and_then(|x| x.checked_mul(time_to_terminal_years)),
+        "inventory risk term",
+    )?;
 
     let two = Decimal::from(2);
-    let one = Decimal::ONE;
-    let adverse_selection_inner = one + risk_aversion / order_intensity;
+    let adverse_selection_inner = checked(
+        risk_aversion
+            .checked_div(order_intensity)
+            .and_then(|x| Decimal::ONE.checked_add(x)),
+        "1 + gamma / k",
+    )?;
     let adverse_selection_ln = decimal_ln(adverse_selection_inner)?;
-    let adverse_selection_term = (two / risk_aversion) * adverse_selection_ln;
+    let adverse_selection_term = checked(
+        two.checked_div(risk_aversion)
+            .and_then(|x| x.checked_mul(adverse_selection_ln)),
+        "adverse selection term",
+    )?;
 
-    let spread = inventory_risk_term + adverse_selection_term;
+    let spread = checked(
+        inventory_risk_term.checked_add(adverse_selection_term),
+        "spread",
+    )?;
 
     if spread < Decimal::ZERO {
         return Err(MMError::NumericalError(
@@ -213,9 +246,9 @@ pub fn calculate_optimal_spread(
 /// * `mid_price` - Current mid-price
 /// * `inventory` - Current inventory position
 /// * `risk_aversion` - Risk aversion parameter (gamma)
-/// * `volatility` - Volatility estimate (annualized)
+/// * `volatility` - Absolute price volatility per √year (see module units)
 /// * `time_to_terminal_ms` - Time to terminal in milliseconds
-/// * `order_intensity` - Order intensity parameter (k)
+/// * `order_intensity` - Order intensity decay `k`, in 1 / price units
 ///
 /// # Returns
 ///
@@ -268,9 +301,9 @@ pub fn calculate_optimal_quotes(
     )?;
 
     let two = Decimal::from(2);
-    let half_spread = spread / two;
-    let bid_price = reservation_price - half_spread;
-    let ask_price = reservation_price + half_spread;
+    let half_spread = checked(spread.checked_div(two), "half spread")?;
+    let bid_price = checked(reservation_price.checked_sub(half_spread), "bid price")?;
+    let ask_price = checked(reservation_price.checked_add(half_spread), "ask price")?;
 
     // Validate quotes
     if bid_price >= ask_price {
@@ -288,10 +321,46 @@ pub fn calculate_optimal_quotes(
     Ok((bid_price, ask_price))
 }
 
+/// Maps a failed checked `Decimal` operation to [`MMError::NumericalError`].
+fn checked(value: Option<Decimal>, what: &str) -> MMResult<Decimal> {
+    value.ok_or_else(|| MMError::NumericalError(format!("avellaneda-stoikov: {what} overflows")))
+}
+
+/// Time to terminal in years (365 day year), with checked arithmetic.
+fn years_to_terminal(time_to_terminal_ms: u64) -> MMResult<Decimal> {
+    checked(
+        Decimal::from(time_to_terminal_ms)
+            .checked_mul(SECONDS_PER_MILLISECOND)
+            .and_then(|x| x.checked_div(SECONDS_PER_YEAR)),
+        "time to terminal",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[test]
+    fn test_calculate_optimal_quotes_overflow_returns_numerical_error() {
+        let result = calculate_optimal_quotes(
+            dec!(1000),
+            dec!(200),
+            dec!(1),
+            dec!(100000000000000),
+            1,
+            dec!(0.3),
+        );
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let spread = calculate_optimal_spread(dec!(1), dec!(100000000000000), u64::MAX, dec!(0.3));
+        assert!(
+            matches!(spread, Err(MMError::NumericalError(_))),
+            "{spread:?}"
+        );
+    }
 
     #[test]
     fn test_reservation_price_flat_inventory() {

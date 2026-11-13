@@ -24,7 +24,7 @@
 //! ```
 
 use crate::Decimal;
-use crate::types::decimal::{decimal_ln, decimal_sqrt};
+use crate::types::decimal::{OrOverflow, decimal_ln, decimal_sqrt};
 use crate::types::error::{MMError, MMResult};
 
 /// Volatility estimator with multiple calculation methods.
@@ -120,7 +120,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Any price is zero or negative
     /// - Numerical calculation fails
     ///
@@ -144,39 +144,29 @@ impl VolatilityEstimator {
         }
 
         // Calculate log returns
-        let mut log_returns = Vec::with_capacity(prices.len() - 1);
-        for i in 1..prices.len() {
-            if prices[i] <= Decimal::ZERO || prices[i - 1] <= Decimal::ZERO {
-                return Err(MMError::InvalidMarketState(
-                    "prices must be positive".to_string(),
-                ));
-            }
-            let ratio = prices[i] / prices[i - 1];
-            let log_return = decimal_ln(ratio)?;
-            log_returns.push(log_return);
-        }
+        let log_returns = log_returns(prices)?;
 
-        // Calculate mean of log returns
-        let sum: Decimal = log_returns.iter().sum();
-        let mean = sum / Decimal::from(log_returns.len());
+        self.simple_of_returns(&log_returns)
+    }
 
-        // Calculate variance
-        let squared_deviations: Decimal = log_returns
-            .iter()
-            .map(|&r| {
-                let dev = r - mean;
-                dev * dev
-            })
-            .sum();
-
-        let variance = squared_deviations / Decimal::from(log_returns.len() - 1);
+    /// Annualized sample standard deviation of log returns already computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] with fewer than 2 returns or on
+    /// arithmetic failure.
+    pub(crate) fn simple_of_returns(&self, log_returns: &[Decimal]) -> MMResult<Decimal> {
+        // Sample variance of the log returns
+        let variance = sample_variance(log_returns)?;
 
         // Calculate standard deviation
         let std_dev = decimal_sqrt(variance)?;
 
         // Annualize
         let annualization_factor = self.get_annualization_factor()?;
-        Ok(std_dev * annualization_factor)
+        std_dev
+            .checked_mul(annualization_factor)
+            .or_overflow("annualized volatility")
     }
 
     /// Calculates volatility using Exponentially Weighted Moving Average (EWMA).
@@ -196,7 +186,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Lambda not in range (0, 1)
     /// - Any price is invalid
     ///
@@ -227,56 +217,48 @@ impl VolatilityEstimator {
         }
 
         // Calculate log returns
-        let mut log_returns = Vec::with_capacity(prices.len() - 1);
-        for i in 1..prices.len() {
-            if prices[i] <= Decimal::ZERO || prices[i - 1] <= Decimal::ZERO {
-                return Err(MMError::InvalidMarketState(
-                    "prices must be positive".to_string(),
-                ));
-            }
-            let ratio = prices[i] / prices[i - 1];
-            let log_return = decimal_ln(ratio)?;
-            log_returns.push(log_return);
-        }
+        let log_returns = log_returns(prices)?;
 
+        self.ewma_of_returns(&log_returns, lambda)
+    }
+
+    /// Annualized EWMA of log returns already computed, in chronological order.
+    /// `lambda` is in `(0, 1)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] with fewer than 2 returns or on
+    /// arithmetic failure.
+    pub(crate) fn ewma_of_returns(
+        &self,
+        log_returns: &[Decimal],
+        lambda: Decimal,
+    ) -> MMResult<Decimal> {
         // Initialize variance with simple variance of first few returns
         let initial_variance = if log_returns.len() >= 5 {
-            let first_returns = &log_returns[0..5];
-            let mean: Decimal = first_returns.iter().sum::<Decimal>() / Decimal::from(5);
-            let squared_devs: Decimal = first_returns
-                .iter()
-                .map(|&r| {
-                    let dev = r - mean;
-                    dev * dev
-                })
-                .sum();
-            squared_devs / Decimal::from(4)
+            sample_variance(log_returns.get(..5).unwrap_or_default())?
         } else {
-            let mean: Decimal =
-                log_returns.iter().sum::<Decimal>() / Decimal::from(log_returns.len());
-            let squared_devs: Decimal = log_returns
-                .iter()
-                .map(|&r| {
-                    let dev = r - mean;
-                    dev * dev
-                })
-                .sum();
-            squared_devs / Decimal::from(log_returns.len() - 1)
+            sample_variance(log_returns)?
         };
 
-        // EWMA recursion
-        let one_minus_lambda = Decimal::ONE - lambda;
+        // EWMA recursion. `0 < lambda < 1`, so `1 - lambda` cannot overflow.
+        let one_minus_lambda = Decimal::ONE.saturating_sub(lambda);
         let mut variance = initial_variance;
 
-        for &log_return in &log_returns {
-            let squared_return = log_return * log_return;
-            variance = lambda * variance + one_minus_lambda * squared_return;
+        for &log_return in log_returns {
+            variance = log_return
+                .checked_mul(log_return)
+                .and_then(|sq| one_minus_lambda.checked_mul(sq))
+                .and_then(|new| lambda.checked_mul(variance)?.checked_add(new))
+                .or_overflow("ewma variance")?;
         }
 
         // Calculate standard deviation and annualize
         let std_dev = decimal_sqrt(variance)?;
         let annualization_factor = self.get_annualization_factor()?;
-        Ok(std_dev * annualization_factor)
+        std_dev
+            .checked_mul(annualization_factor)
+            .or_overflow("annualized volatility")
     }
 
     /// Calculates volatility using Parkinson's range-based estimator.
@@ -332,22 +314,25 @@ impl VolatilityEstimator {
 
         let mut sum_squared_ratios = Decimal::ZERO;
 
-        for i in 0..high_prices.len() {
-            if high_prices[i] <= Decimal::ZERO || low_prices[i] <= Decimal::ZERO {
+        for (&high, &low) in high_prices.iter().zip(low_prices) {
+            if high <= Decimal::ZERO || low <= Decimal::ZERO {
                 return Err(MMError::InvalidMarketState(
                     "prices must be positive".to_string(),
                 ));
             }
 
-            if high_prices[i] < low_prices[i] {
+            if high < low {
                 return Err(MMError::InvalidMarketState(
                     "high price must be >= low price".to_string(),
                 ));
             }
 
-            let ratio = high_prices[i] / low_prices[i];
+            let ratio = high.checked_div(low).or_overflow("high low ratio")?;
             let log_ratio = decimal_ln(ratio)?;
-            sum_squared_ratios += log_ratio * log_ratio;
+            sum_squared_ratios = log_ratio
+                .checked_mul(log_ratio)
+                .and_then(|sq| sum_squared_ratios.checked_add(sq))
+                .or_overflow("parkinson sum")?;
         }
 
         // Parkinson formula: σ² = (1/(4n*ln(2))) * Σ(ln(H/L))²
@@ -355,18 +340,119 @@ impl VolatilityEstimator {
         let n = Decimal::from(high_prices.len());
         let four = Decimal::from(4);
 
-        let variance = sum_squared_ratios / (four * n * ln_2);
+        let variance = four
+            .checked_mul(n)
+            .and_then(|x| x.checked_mul(ln_2))
+            .and_then(|d| sum_squared_ratios.checked_div(d))
+            .or_overflow("parkinson variance")?;
         let std_dev = decimal_sqrt(variance)?;
 
         // Annualize
         let annualization_factor = self.get_annualization_factor()?;
-        Ok(std_dev * annualization_factor)
+        std_dev
+            .checked_mul(annualization_factor)
+            .or_overflow("annualized volatility")
     }
+}
+
+/// The sample variance `Σ(r - mean)² / (n - 1)` of `returns`.
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if a sum overflows or there are
+/// fewer than 2 returns.
+fn sample_variance(returns: &[Decimal]) -> MMResult<Decimal> {
+    let n = Decimal::from(returns.len());
+    let mean = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, &r| acc.checked_add(r))
+        .and_then(|sum| sum.checked_div(n))
+        .or_overflow("mean log return")?;
+    let squared_deviations = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, &r| {
+            let dev = r.checked_sub(mean)?;
+            acc.checked_add(dev.checked_mul(dev)?)
+        })
+        .or_overflow("squared deviations")?;
+    let dof = returns
+        .len()
+        .checked_sub(1)
+        .map(Decimal::from)
+        .or_overflow("degrees of freedom")?;
+    squared_deviations
+        .checked_div(dof)
+        .or_overflow("sample variance")
+}
+
+/// Computes the log returns `ln(p[i] / p[i - 1])` of a price series.
+///
+/// # Errors
+///
+/// Returns `MMError::InvalidMarketState` if any price is not positive or
+/// there are fewer than 2 returns.
+fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
+    let log_returns = consecutive_log_returns(prices)?;
+    // The sample variance divides by `n - 1`.
+    if log_returns.len() < 2 {
+        return Err(MMError::InvalidMarketState(format!(
+            "need at least 2 log returns (3 prices), got {}",
+            log_returns.len()
+        )));
+    }
+    Ok(log_returns)
+}
+
+/// Computes the log returns of a price series, however few.
+///
+/// # Errors
+///
+/// Returns `MMError::InvalidMarketState` if any price is not positive.
+pub(crate) fn consecutive_log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
+    let mut log_returns = Vec::with_capacity(prices.len().saturating_sub(1));
+    for window in prices.windows(2) {
+        let [prev, next] = window else {
+            continue;
+        };
+        if *next <= Decimal::ZERO || *prev <= Decimal::ZERO {
+            return Err(MMError::InvalidMarketState(
+                "prices must be positive".to_string(),
+            ));
+        }
+        log_returns.push(decimal_ln(
+            next.checked_div(*prev).or_overflow("price ratio")?,
+        )?);
+    }
+    Ok(log_returns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sample_variance_overflow_returns_numerical_error() {
+        let result = sample_variance(&[Decimal::MAX, Decimal::MAX]);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(sample_variance(&[dec!(1), dec!(3)]).unwrap(), dec!(2));
+    }
+
+    #[test]
+    fn test_calculate_simple_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_simple(&[dec!(100), dec!(101)]);
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
+
+    #[test]
+    fn test_calculate_ewma_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_ewma(&[dec!(100), dec!(101)], dec!(0.94));
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
     use crate::dec;
 
     #[test]

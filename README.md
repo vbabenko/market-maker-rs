@@ -15,8 +15,12 @@
 ## Market Making Library
 
 A comprehensive Rust library implementing quantitative market making strategies based on
-the Avellaneda-Stoikov model and extensions. This library provides production-ready
-components for building automated market making systems for financial markets.
+the Avellaneda-Stoikov model and extensions. It provides components for building
+automated market making systems, causal backtests of them, and a deterministic kernel
+that an external reinforcement learning trainer can step.
+
+A live deployment still needs its own exchange connectivity, monitoring and validation:
+the results in this repository are simulations and replays, not evidence of profit.
 
 ### Overview
 
@@ -38,10 +42,13 @@ liquidity to the market.
 #### Strategy Models
 
 - **Avellaneda-Stoikov**: Classic optimal market making with reservation price
-- **GLFT Extension**: Guéant-Lehalle-Fernandez-Tapia with terminal penalties
+- **GLFT**: Guéant-Lehalle-Fernandez-Tapia optimal quotes with a bounded inventory (exact solution and closed form)
 - **Grid Trading**: Multi-level order placement with geometric/arithmetic spacing
 - **Adaptive Spread**: Dynamic spread adjustment based on order book imbalance
 - **Depth-Based Offering**: Size adjustment based on market depth
+- **Signal Quotes**: Causal, bounded quote adjustment from order book imbalance (`strategy::signal_quote`)
+- **Walk-Forward Calibration**: Chronological splits and causal calibration, with venues that close (`strategy::walk_forward`)
+- **Joint Quotes**: Closed-form quotes for correlated assets (feature `multi-underlying`)
 
 #### Risk Management
 
@@ -59,6 +66,7 @@ liquidity to the market.
 - **Order Intensity Estimation**: Fill rate modeling for parameter calibration
 - **Live Metrics**: Real-time operational metrics with atomic counters
 - **Prometheus Export**: Optional metrics export with Grafana dashboard
+- **Micro-Price**: Stoikov's micro-price (`analytics::micro_price`)
 
 #### Backtesting
 
@@ -66,6 +74,15 @@ liquidity to the market.
 - **Fill Models**: Immediate, queue position, probabilistic, market impact
 - **Performance Metrics**: Sharpe, Sortino, Calmar, max drawdown, profit factor
 - **Slippage Models**: Fixed, percentage, volatility-based
+- **Evaluation Harness**: Experiments that compare strategies under one set of rules, metric
+  attribution, fee scenarios and block bootstrap intervals (`backtest::evaluation`)
+- **Order Flow Simulators**: A seedable queue-reactive simulator, with an opt-in reference that
+  reacts to the agent (`backtest::queue_reactive`), and the QRH-I queue-reactive Hawkes model
+  with seasonality (`backtest::hawkes`)
+- **Hyperliquid Replay**: Decoders for its streams and a rebuilt book sampled on a time grid
+  (`backtest::hyperliquid`, feature `serde`)
+- **Derivative Contracts**: Several dated futures against one ledger, perpetual funding,
+  contract lifecycle and initial margin before an order (features `margin` and `instruments`)
 
 #### Execution
 
@@ -90,6 +107,23 @@ liquidity to the market.
 - **Chain-Level Risk**: Aggregate Greeks across the chain
 - **ATM Detection**: Automatic spread adjustment for ATM options
 - **Chain Risk Manager**: Chain-wide limits and hedging
+
+#### Reinforcement Learning Support (Features: `kernel`, `rl`)
+
+- **Financial Kernel**: The backtest loop as a resumable, `Copy` state machine with a canonical
+  encoding, exactly equivalent to the engine inside its documented subset
+- **Versioned Spaces**: Observations, actions, masks and a `Decimal` reward that reconciles with
+  the evaluation harness
+- **Quote Control**: Cancel-only actions and quotes that expire at the venue, exact in venue time
+- **Hedging**: A hedge lane in a second instrument, and a balance gate through `margin-rs`
+- **Residual Policies**: Corrections on top of a classical quote
+- **Python Bridge**: `bridges/python`, a nested crate outside this package, for external trainers
+
+#### Options, Surfaces and Settlement (Feature: `options`)
+
+- **Pricing**: European option valuation (`options::pricing`)
+- **Volatility Surfaces**: SVI slices and surfaces, calibration and upstream surfaces (`options::surface`)
+- **Settlement**: Option positions held and settled in a `margin-rs` ledger (`options::settlement`, with `margin`)
 
 #### Parameter Calibration
 
@@ -131,13 +165,21 @@ Where:
 - [`backtest`]: Historical simulation with fill models and metrics
 - [`types`]: Common types, decimals, and error definitions
 - [`prelude`]: Convenient re-exports of commonly used types
-- `options`: Options pricing, Greeks, and market making (feature: `options`)
+- `options`: Options pricing, surfaces, Greeks, settlement and market making (feature: `options`)
 - `chain`: Option chain integration and multi-strike quoting (feature: `chain`)
 - `api`: REST/WebSocket API layer (feature: `api`)
 - `persistence`: Data persistence layer (feature: `persistence`)
-- `multi_underlying`: Multi-asset management (feature: `multi-underlying`)
+- `multi_underlying`: Multi-asset management and closed-form joint quotes (feature: `multi-underlying`; with `margin`, each quote through a `margin-rs` gate)
 - `events`: Event broadcasting system (feature: `events`)
 - `data_feeds`: Real-time market data feeds (feature: `data-feeds`)
+- `l3`: Order by order book reconstruction with a quality manifest and
+  declared queue limits (feature: `l3`)
+- `instruments`: Contract specifications shared with `margin-rs` and
+  `arbitrage-rs`, and their conversion into `margin-rs` instruments
+  (feature: `instruments`, with `margin` for the conversion), and the net edge
+  of a spot and a dated future, a calendar spread under an assumed exit and a
+  roll plan (feature: `arbitrage`)
+- `rl`: Versioned observation, action and reward spaces over the kernel (feature: `rl`)
 
 ### Quick Start
 
@@ -164,6 +206,25 @@ let (bid, ask) = market_maker_rs::strategy::avellaneda_stoikov::calculate_optima
 println!("Bid: {}, Ask: {}", bid, ask);
 ```
 
+### Shared Types
+
+The order direction and the option style are the shared enums of the
+`financial_types` crate, also used by `margin-rs`, `arbitrage-rs` and
+OptionStratLib, and re-exported from the [`prelude`]:
+
+- `Action` (`Buy`/`Sell`) for every order, fill and query side. It also
+  has an `Other` variant, which this crate does not support: methods that
+  take or process an order, a fill or a side return
+  `MMError::UnsupportedAction` for it, before changing anything; a
+  pretrade check rejects the order; and a pretrade policy that receives a
+  fill with that side also latches a fault and rejects every later order
+  until it is reset.
+- `OptionStyle` (`Call`/`Put`).
+
+`financial_types` derives `serde` unconditionally, so `serde` is compiled
+even with no features enabled; the `serde` feature still gates this
+crate's own serialization support.
+
 ### Feature Flags
 
 - `prometheus`: Enable Prometheus metrics export (adds `prometheus`, `hyper`, `tokio` dependencies)
@@ -174,7 +235,51 @@ println!("Bid: {}, Ask: {}", bid, ask);
 - `persistence`: Enable persistence layer for market maker data
 - `multi-underlying`: Enable multi-asset management with correlation tracking
 - `events`: Enable event broadcasting system for real-time updates
+- `margin`: Use `margin-rs` in the backtest: its exact ledger as the fill
+  accountant (`backtest::MarginLedgerAccountant`) and its risk gate as the
+  pretrade policy (`backtest::MarginAccount`)
 - `data-feeds`: Enable real-time market data feed abstractions
+- `l3`: Enable order by order (L3) book reconstruction: snapshot and
+  sequenced messages, fail closed on gaps and inconsistencies, a quality
+  manifest, and volume ahead under declared hypotheses (no dependencies)
+- `instruments`: Contract specifications from `financial_types`
+  (`instruments` module): validated specifications, exact money and
+  dated venue snapshots, and orders and fills checked against them
+  (`instruments::orders`); with `margin` too, their conversion into
+  `margin-rs` instruments and executions (`instruments::margin`), and several
+  dated futures in one backtest run against one ledger
+  (`backtest::contracts`). Both
+  together need
+  `margin-rs` 0.1.1 or later: Cargo does not upgrade a lockfile at 0.1.0
+  by itself, so run `cargo update -p margin-rs`
+- `arbitrage`: The net edge of a spot and a linear dated future
+  (`instruments::basis`), through `arbitrage-rs`, whose types stay out of this
+  crate's public API, a calendar spread under an assumed exit
+  (`instruments::calendar`), and a two contract roll plan (`instruments::roll`),
+  checked against a ledger and run in a backtest (`instruments::roll::run`) with
+  `margin` too; implies `instruments`
+- `kernel`: The financial environment kernel (`backtest::kernel`): the
+  backtest engine's loop as a resumable, `Copy` state machine with a
+  canonical encoding, an agent-safe observation and an admission mask,
+  exactly equivalent to the engine inside its documented subset. Meant to
+  be stepped by an external RL trainer through a bridge crate. No extra
+  dependencies.
+- `rl`: Versioned observation, action and reward spaces over the kernel (`rl`),
+  for an external RL trainer or engine: features a real agent could know, masks
+  apart from the hard limits, and a `Decimal` reward that reconciles with
+  `backtest::evaluation`, with the `f32` derived from it. Implies `kernel`.
+
+### Research Status
+
+The 0.7.0 cycle added an out-of-sample research program under `bridges/python/experiments`,
+which is not part of the published crate. The studies fix their designs in advance, disclose
+any exception, such as a holdout that had been read before, and report negative results. So
+far no learned policy has been shown to beat the best classical comparator out of sample, so
+the crate recommends none. Most of these studies are synthetic, and some remain open: treat
+their conclusions as limited to the setting each report states.
+
+The consolidated report, with the evidence and product matrices and the open gaps, is
+`doc/RESEARCH_CONSOLIDATION.md` in the repository.
 
 ### Examples
 
@@ -258,10 +363,10 @@ println!("Delta: {}, Gamma: {}", greeks.delta, greeks.gamma);
 
 // Aggregate portfolio Greeks
 let mut portfolio = PortfolioGreeks::new();
-portfolio.add(&greeks, dec!(10.0)); // 10 contracts
+portfolio.add(&greeks, dec!(10.0)).unwrap(); // 10 contracts
 
 // Check delta neutrality
-let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0));
+let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0)).unwrap();
 ```
 
 #### Options Market Making (Feature: `options`)
@@ -304,7 +409,7 @@ let hedger_config = AutoHedgerConfig::default();
 let mut risk_manager = GreeksRiskManager::new("BTC", limits, hedger_config);
 
 // Check if order is allowed
-let decision = risk_manager.check_order(&option_greeks, dec!(10.0));
+let decision = risk_manager.check_order(&option_greeks, dec!(10.0)).unwrap();
 match decision {
     OrderDecision::Allowed => { /* proceed */ },
     OrderDecision::Scaled { new_size, .. } => { /* use scaled size */ },
@@ -312,15 +417,16 @@ match decision {
 }
 
 // Check if hedging is needed
-if risk_manager.needs_hedge() {
-    let hedge = risk_manager.calculate_hedge_order(underlying_price);
+if risk_manager.needs_hedge().unwrap() {
+    let hedge = risk_manager.calculate_hedge_order(underlying_price).unwrap();
 }
 ```
 
 #### Option Chain Market Making (Feature: `chain`)
 
 ```rust
-use market_maker_rs::chain::{ChainMarketMaker, ChainMarketMakerConfig};
+use market_maker_rs::chain::{ChainMarketMaker, ChainMarketMakerConfig, ChainPricing, ChainQuoteOutcome};
+use market_maker_rs::options::{Dynamics, FlatSurface, SurfacePricer, tau_from_days};
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
 use std::sync::Arc;
 
@@ -329,13 +435,24 @@ let chain = Arc::new(ExpirationOrderBook::new("BTC", expiration));
 let config = ChainMarketMakerConfig::default();
 let mm = ChainMarketMaker::new(chain, config);
 
-// Refresh all quotes across the chain
-let quotes = mm.refresh_all_quotes(underlying_price).unwrap();
+// Valuation inputs for this expiration (surface, dynamics, rates, tau)
+let pricer = SurfacePricer::new(Arc::new(FlatSurface::new(dec!(0.6))?), Dynamics::StickyMoneyness)?;
+let pricing = ChainPricing::new(Arc::new(pricer), tau_from_days(dec!(30))?, dec!(0), dec!(0))?;
 
-// Check chain risk status
-let status = mm.check_chain_risk();
+// Refresh all quotes across the chain: one outcome per contract
+for outcome in mm.refresh_all_quotes(underlying_price, &pricing)? {
+    match outcome {
+        ChainQuoteOutcome::Quote(quote) => { /* publish */ }
+        ChainQuoteOutcome::NotQuoted { reason, .. } => { /* withdraw any resting quote */ }
+        _ => {}
+    }
+}
+
+// Check chain risk status. While it does not allow quoting, the refresh
+// above refuses with `MMError::QuotingHalted`.
+let status = mm.check_chain_risk().unwrap();
 if !status.can_quote() {
-    // Stop quoting or hedge
+    // Withdraw resting quotes, and hedge or reconcile
 }
 ```
 
@@ -376,7 +493,7 @@ let hedges = manager.get_cross_asset_hedges();
 ```rust
 use market_maker_rs::events::{
     EventBroadcaster, EventBroadcasterConfig, EventFilter, EventType,
-    MarketMakerEvent, Side,
+    MarketMakerEvent, Action,
 };
 use std::sync::Arc;
 
@@ -398,7 +515,7 @@ broadcaster.broadcast(MarketMakerEvent::OrderFilled {
     order_id: "ORD-001".to_string(),
     symbol: "BTC".to_string(),
     instrument: "BTC-PERP".to_string(),
-    side: Side::Buy,
+    side: Action::Buy,
     quantity: 10,
     price: 50000,
     fee: 5,
@@ -503,3 +620,28 @@ maintainer:
 We appreciate your interest and look forward to your contributions!
 
 **License**: MIT
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+| Repository | Description |
+|------------|-------------|
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book used by the optional `chain` feature for chain-level quoting. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing and Greeks used by the optional `options` feature. |
+| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | Limit order book and matching engine used as the core book for quoting and backtesting. |
+| [arbitrage-rs](https://github.com/joaquinbejar/arbitrage-rs) | Arbitrage models used by the optional `arbitrage` feature for opportunity detection. |
+| [financial_types](https://github.com/joaquinbejar/financial_types) | Fundamental financial enums and contract specifications used across the crate. |
+| [margin-rs](https://github.com/joaquinbejar/margin-rs) | Risk and margin engine used by the optional `margin` feature for accounting and pretrade risk. |
+| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) | Derive macros for JSON display formatting used by the optional `serde` feature. |
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [quotebook](https://github.com/joaquinbejar/quotebook) | RFQ on Solana with off-chain signed maker quotes; uses market-maker-rs to compute maker quotes. |
+
+<!-- related-projects:end -->

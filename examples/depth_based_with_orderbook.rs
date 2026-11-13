@@ -26,8 +26,8 @@ fn main() {
     println!("=== Setup ===\n");
 
     // Create orderbook for BTC/USD
-    // Note: OrderBook requires type parameters for the price/quantity types
-    let orderbook: OrderBook<OrderId> = OrderBook::new("BTC/USD");
+    // Note: OrderBook is generic over per-order extra fields; `()` means none
+    let orderbook: DefaultOrderBook = OrderBook::new("BTC/USD");
     println!("Created OrderBook instance from orderbook-rs");
     println!("  Symbol: {}", orderbook.symbol());
     println!();
@@ -144,8 +144,8 @@ fn main() {
     println!();
 
     // Calculate order sizes
-    let ask_size = strategy.calculate_ask_size(current_inventory);
-    let bid_size = strategy.calculate_bid_size(current_inventory);
+    let ask_size = strategy.calculate_ask_size(current_inventory).unwrap();
+    let bid_size = strategy.calculate_bid_size(current_inventory).unwrap();
 
     println!("Calculated Order Sizes:");
     println!(

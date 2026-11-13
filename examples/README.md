@@ -17,6 +17,18 @@ cargo run --example full_strategy
 
 # With serde feature (for Display/Debug formatting)
 cargo run --example display_example --features serde
+
+# Real data, not in this repository: decompressed files of the Hyperliquid capture
+cargo run --release --features serde --example hyperliquid_hour -- BTC 1 10 <statuses> <diffs> <trades>
+cargo run --release --features serde --example hyperliquid_validation -- BTC 1 10 <out dir> <statuses> <diffs> <trades>
+
+# Research, on synthetic data only
+cargo run --example offline_rl_support
+cargo run --example consistent_time_travel
+cargo run --release --features serde --example time_travel_queues -- synthetic bridges/python/experiments/m4_05/design.json
+cargo run --release --example quote_duration
+cargo run --release --features chain --example chain_pricing_evaluation -- <commit> <toolchain>
+cargo run --release --features options,margin,multi-underlying --example option_quoting
 ```
 
 ## Examples Overview
@@ -173,6 +185,21 @@ cargo run --example display_example --features serde
 - When feature `serde` is enabled
 
 **Run:** `cargo run --example display_example --features serde`
+
+---
+
+### 10. `counterpart.rs` - Batch Counterpart (requires `options` feature)
+**What it demonstrates:**
+- `calibrate`: a surface from a quotes CSV with `calibrate_surface`, written as JSON (status, slices, report)
+- `price`: European values and total Greeks on that surface for a requests CSV, one response row per request
+- `identity`: the protocol, crate version and build commit as JSON
+
+**Key concepts:**
+- Decimal in and out of the CSV files, never through `f64`
+- An error is a row with a class (`InvalidInput`, `Unsupported`, `Numerical`), never a number
+- Exit code 2 only on a protocol failure
+
+**Run:** `cargo run --example counterpart --features options -- identity`
 
 ---
 

@@ -107,3 +107,28 @@ maintainer:
 We appreciate your interest and look forward to your contributions!
 
 **License**: MIT
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+| Repository | Description |
+|------------|-------------|
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book used by the optional `chain` feature for chain-level quoting. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing and Greeks used by the optional `options` feature. |
+| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | Limit order book and matching engine used as the core book for quoting and backtesting. |
+| [arbitrage-rs](https://github.com/joaquinbejar/arbitrage-rs) | Arbitrage models used by the optional `arbitrage` feature for opportunity detection. |
+| [financial_types](https://github.com/joaquinbejar/financial_types) | Fundamental financial enums and contract specifications used across the crate. |
+| [margin-rs](https://github.com/joaquinbejar/margin-rs) | Risk and margin engine used by the optional `margin` feature for accounting and pretrade risk. |
+| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) | Derive macros for JSON display formatting used by the optional `serde` feature. |
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [quotebook](https://github.com/joaquinbejar/quotebook) | RFQ on Solana with off-chain signed maker quotes; uses market-maker-rs to compute maker quotes. |
+
+<!-- related-projects:end -->

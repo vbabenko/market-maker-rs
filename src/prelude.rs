@@ -12,6 +12,7 @@ pub use crate::types::decimal::{decimal_ln, decimal_powi, decimal_sqrt};
 pub use crate::{Decimal, dec};
 
 // Re-export types module
+pub use crate::types::action::{Action, OptionStyle};
 pub use crate::types::error::{MMError, MMResult};
 pub use crate::types::primitives::{
     OrderIntensity, Price, Quantity, RiskAversion, Timestamp, Volatility,
@@ -28,7 +29,7 @@ pub use crate::strategy::calibration::{
     RiskAversionCalibrator, VolatilityRegime, VolatilityRegimeDetector,
 };
 pub use crate::strategy::config::StrategyConfig;
-pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, PenaltyFunction};
+pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, GlftQuotes};
 pub use crate::strategy::grid::{GridConfig, GridOrder, GridStrategy, OrderSide};
 pub use crate::strategy::quote::Quote;
 
@@ -70,7 +71,7 @@ pub use crate::execution::{
     LatencyTracker, LatencyTrackerConfig, ManagedOrder, MarketDataStream, MockConfig,
     MockExchangeConnector, OrderBookConnector, OrderBookConnectorConfig, OrderBookSnapshot,
     OrderId, OrderManager, OrderManagerConfig, OrderManagerStats, OrderRequest, OrderResponse,
-    OrderStatus, OrderType, Side, ThreadSafeOrderManager, TimeInForce,
+    OrderStatus, OrderType, ThreadSafeOrderManager, TimeInForce,
 };
 
 // Re-export backtest types

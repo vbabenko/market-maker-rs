@@ -2,7 +2,7 @@
 //!
 //! This module implements various market making strategies:
 //! - Avellaneda-Stoikov model using stochastic control theory
-//! - Guéant-Lehalle-Fernandez-Tapia (GLFT) model extension
+//! - Guéant-Lehalle-Fernandez-Tapia (GLFT) optimal quotes with a bounded inventory
 //! - Grid trading for ranging markets
 //! - Depth-based offering
 //! - Adaptive spread based on order book imbalance
@@ -44,8 +44,11 @@ pub mod grid;
 /// Adaptive spread based on order book imbalance.
 pub mod adaptive_spread;
 
-/// Guéant-Lehalle-Fernandez-Tapia (GLFT) model extension.
 pub mod glft;
 
 /// Parameter calibration tools for strategy optimization.
 pub mod calibration;
+
+pub mod walk_forward;
+
+pub mod signal_quote;

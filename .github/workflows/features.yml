@@ -1,0 +1,137 @@
+name: Feature Matrix
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  no_default_features:
+    name: Test (no default features)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      - name: Run tests without default features
+        run: cargo test --no-default-features
+
+      - name: Feature list matches Cargo.toml
+        # The matrix below is hand maintained; fail when a feature is added
+        # to or removed from Cargo.toml without updating it.
+        run: |
+          declared=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].features | keys[] | select(. != "default")' | sort)
+          checked=$(sed -n '/^        feature:$/,/^$/p' .github/workflows/features.yml \
+            | sed -n 's/^          - //p' | sort)
+          if [ "$declared" != "$checked" ]; then
+            echo "Cargo.toml features:"; echo "$declared"
+            echo "Matrix features:"; echo "$checked"
+            exit 1
+          fi
+
+  feature_check:
+    name: Check (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - arbitrage
+          - serde
+          - prometheus
+          - options
+          - chain
+          - data-feeds
+          - l3
+          - api
+          - persistence
+          - multi-underlying
+          - events
+          - margin
+          - instruments
+          - kernel
+          - rl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      - name: Check feature ${{ matrix.feature }} alone
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --all-targets
+
+      # The library alone, without the dev-dependencies (whose features
+      # unify into every test build).
+      - name: Check the library with feature ${{ matrix.feature }} alone
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --lib
+
+  margin_instruments:
+    name: Test (margin + instruments)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      # arbitrage-rs is a normal dependency only with this feature.
+      - name: Test the basis evaluation
+        run: cargo test --no-default-features --features arbitrage --lib --test instruments_basis --test instruments_calendar --test instruments_roll --test instruments_roll_guard
+
+      - name: Test the roll plan against a ledger
+        run: cargo test --no-default-features --features arbitrage,margin --test instruments_roll --test instruments_roll_guard --test backtest_roll
+
+      # The margin-rs adapter is compiled only with both features.
+      - name: Test the margin-rs instrument adapter
+        run: cargo test --no-default-features --features margin,instruments --lib --test instruments_margin --test instruments_orders --test instruments_futures --test backtest_derivatives --test backtest_contracts
+
+  kernel_tests:
+    name: Test (kernel)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      # Every integration test binary gated on the feature, and its unit tests.
+      - name: Test the kernel
+        run: cargo test --features kernel

@@ -20,11 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
-          profile: minimal
           toolchain: stable
-          override: true
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
@@ -32,16 +30,17 @@ jobs:
       # INSTALL TARPALUIN FOR CODE COVERAGE
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       - name: Install Tarpaulin.
-        run: cargo install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked --version '>=0.37.5'
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # GENERATE CODE COVERAGE REPORT
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       - name: Generate code coverage report.
         run:
           cargo tarpaulin
+          --engine llvm
           --all-features
           --workspace
-          --timeout 180
+          --timeout 600
           --out Xml
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # UPLOAD CODE COVERAGE REPORT TO CODECOV.IO

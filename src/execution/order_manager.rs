@@ -17,7 +17,7 @@
 //!
 //! ```rust
 //! use market_maker_rs::execution::{
-//!     OrderManager, OrderManagerConfig, OrderRequest, Side
+//!     OrderManager, OrderManagerConfig, OrderRequest, Action
 //! };
 //! use market_maker_rs::dec;
 //!
@@ -37,9 +37,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::Decimal;
+use crate::risk::pretrade::{
+    OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
+};
 use crate::types::error::{MMError, MMResult};
 
-use super::connector::{Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType, Side};
+use super::connector::{
+    Action, Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType,
+};
+use crate::types::action::Dir;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -51,14 +57,14 @@ use serde::{Deserialize, Serialize};
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::execution::{ManagedOrder, OrderId, Side, OrderType, OrderStatus};
+/// use market_maker_rs::execution::{ManagedOrder, OrderId, Action, OrderType, OrderStatus};
 /// use market_maker_rs::dec;
 ///
 /// let order = ManagedOrder::new(
 ///     OrderId::new("12345"),
 ///     "client-1".to_string(),
 ///     "BTC-USD".to_string(),
-///     Side::Buy,
+///     Action::Buy,
 ///     OrderType::Limit,
 ///     dec!(50000.0),
 ///     dec!(0.1),
@@ -78,7 +84,7 @@ pub struct ManagedOrder {
     /// Trading symbol.
     pub symbol: String,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Order type.
     pub order_type: OrderType,
     /// Original order price.
@@ -109,7 +115,7 @@ impl ManagedOrder {
         order_id: OrderId,
         client_order_id: String,
         symbol: String,
-        side: Side,
+        side: Action,
         order_type: OrderType,
         price: Decimal,
         quantity: Decimal,
@@ -152,25 +158,30 @@ impl ManagedOrder {
     }
 
     /// Returns the fill ratio (filled / original).
+    ///
+    /// Report only: an overfill whose ratio overflows saturates at the
+    /// `Decimal` bound, so it never reads as unfilled.
     #[must_use]
     pub fn fill_ratio(&self) -> Decimal {
         if self.original_quantity > Decimal::ZERO {
-            self.filled_quantity / self.original_quantity
+            crate::types::decimal::saturating_div(self.filled_quantity, self.original_quantity)
         } else {
             Decimal::ZERO
         }
     }
 
-    /// Returns the notional value of the original order.
+    /// Returns the notional value of the original order, saturating at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn original_notional(&self) -> Decimal {
-        self.original_price * self.original_quantity
+        self.original_price.saturating_mul(self.original_quantity)
     }
 
-    /// Returns the notional value of filled quantity.
+    /// Returns the notional value of filled quantity, saturating at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn filled_notional(&self) -> Decimal {
-        self.average_fill_price * self.filled_quantity
+        self.average_fill_price.saturating_mul(self.filled_quantity)
     }
 
     /// Returns the age of the order in milliseconds.
@@ -180,18 +191,45 @@ impl ManagedOrder {
     }
 
     /// Records a fill and updates quantities and average price.
-    pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) {
-        let new_filled = self.filled_quantity + fill.quantity;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if the fill's side or the
+    /// order's side is neither buy nor sell, or [`MMError::NumericalError`]
+    /// if the filled quantity, remaining quantity or average price
+    /// overflows; the order is unchanged in both cases.
+    pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
+        Dir::try_from(self.side)?;
+        Dir::try_from(fill.side)?;
+        let overflow = |what: &str| {
+            MMError::NumericalError(format!(
+                "fill of {} at {} overflows the {what}",
+                fill.quantity, fill.price
+            ))
+        };
+        let new_filled = self
+            .filled_quantity
+            .checked_add(fill.quantity)
+            .ok_or_else(|| overflow("filled quantity"))?;
 
         // Calculate new VWAP
-        if new_filled > Decimal::ZERO {
-            let old_value = self.average_fill_price * self.filled_quantity;
-            let new_value = fill.price * fill.quantity;
-            self.average_fill_price = (old_value + new_value) / new_filled;
-        }
+        let average_fill_price = if new_filled > Decimal::ZERO {
+            self.average_fill_price
+                .checked_mul(self.filled_quantity)
+                .and_then(|old| old.checked_add(fill.price.checked_mul(fill.quantity)?))
+                .and_then(|total| total.checked_div(new_filled))
+                .ok_or_else(|| overflow("average price"))?
+        } else {
+            self.average_fill_price
+        };
+        let remaining_quantity = self
+            .original_quantity
+            .checked_sub(new_filled)
+            .ok_or_else(|| overflow("remaining quantity"))?;
 
+        self.average_fill_price = average_fill_price;
         self.filled_quantity = new_filled;
-        self.remaining_quantity = self.original_quantity - new_filled;
+        self.remaining_quantity = remaining_quantity;
         self.updated_at = timestamp;
         self.fills.push(fill.clone());
 
@@ -207,6 +245,7 @@ impl ManagedOrder {
                 remaining_qty: self.remaining_quantity,
             };
         }
+        Ok(())
     }
 
     /// Updates the order status.
@@ -363,6 +402,63 @@ impl OrderManager {
         &self.config
     }
 
+    /// Passes the order through `policy` and registers it with the approved
+    /// quantity.
+    ///
+    /// This is the same pretrade seam the backtest engine uses, so quotes and
+    /// hedges sent through the live path are checked by the same policy.
+    /// Nothing is registered on a rejection or a zero approved quantity; a
+    /// reduction never increases the quantity. The caller forwards the
+    /// order's later lifecycle to the policy with
+    /// [`PretradePolicy::on_order_event`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if `request.side` is neither
+    /// buy nor sell, before the policy is asked, and the
+    /// [`OrderManager::register_order`] errors for an approved order. If
+    /// registration fails and the policy then fails to release the
+    /// reservation, the policy's error is returned instead.
+    pub fn register_order_checked(
+        &mut self,
+        request: &OrderRequest,
+        client_order_id: String,
+        timestamp: u64,
+        purpose: OrderPurpose,
+        policy: &mut dyn PretradePolicy,
+    ) -> MMResult<PretradeDecision> {
+        // Before the policy reserves anything.
+        Dir::try_from(request.side)?;
+        let pretrade = PretradeRequest::new(
+            client_order_id.clone(),
+            request.side,
+            request.price,
+            request.quantity,
+            purpose,
+            timestamp,
+        )
+        .with_instrument(request.symbol.clone());
+        let decision = policy.check(&pretrade);
+        let approved = decision.approved_quantity(request.quantity);
+        if approved <= Decimal::ZERO {
+            return Ok(decision);
+        }
+        let mut approved_request = request.clone();
+        approved_request.quantity = approved;
+        if let Err(error) =
+            self.register_order(&approved_request, client_order_id.clone(), timestamp)
+        {
+            // The policy reserved the approved quantity; nothing reached the
+            // venue, so release it. A policy that cannot take the release
+            // is the more serious failure and is reported instead.
+            policy.on_order_event(&OrderEvent::VenueRejected {
+                order_id: client_order_id,
+            })?;
+            return Err(error);
+        }
+        Ok(decision)
+    }
+
     /// Registers a new order before submission.
     ///
     /// # Arguments
@@ -374,6 +470,7 @@ impl OrderManager {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The side is neither buy nor sell ([`MMError::UnsupportedAction`])
     /// - Duplicate client_order_id exists (if detection enabled)
     /// - Maximum open orders exceeded for the symbol
     pub fn register_order(
@@ -382,6 +479,7 @@ impl OrderManager {
         client_order_id: String,
         timestamp: u64,
     ) -> MMResult<()> {
+        Dir::try_from(request.side)?;
         // Check for duplicates
         if self.config.detect_duplicates && self.orders.contains_key(&client_order_id) {
             return Err(MMError::InvalidMarketState(format!(
@@ -472,7 +570,15 @@ impl OrderManager {
     ///
     /// * `fill` - Fill information
     /// * `timestamp` - Current timestamp in milliseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The fill's side, or the matched order's side, is neither buy nor
+    ///   sell ([`MMError::UnsupportedAction`]), before any state changes
+    /// - No order matches the fill's order ID
     pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
+        Dir::try_from(fill.side)?;
         // Find order by exchange ID
         let client_id = self
             .orders_by_exchange_id
@@ -487,7 +593,7 @@ impl OrderManager {
                 MMError::InvalidMarketState(format!("order not found: {}", client_id))
             })?;
 
-            order.record_fill(fill, timestamp);
+            order.record_fill(fill, timestamp)?;
             (order.symbol.clone(), order.is_terminal())
         };
 
@@ -557,13 +663,22 @@ impl OrderManager {
     }
 
     /// Gets total open quantity for a side.
-    #[must_use]
-    pub fn get_open_quantity(&self, symbol: &str, side: Side) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
+    /// sell, or [`MMError::NumericalError`] if the total overflows.
+    pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
+        let side = Action::from(Dir::try_from(side)?);
         self.get_open_orders_for_symbol(symbol)
             .iter()
             .filter(|o| o.side == side)
-            .map(|o| o.remaining_quantity)
-            .sum()
+            .try_fold(Decimal::ZERO, |acc, o| {
+                acc.checked_add(o.remaining_quantity)
+            })
+            .ok_or_else(|| {
+                MMError::NumericalError(format!("open {side} quantity on {symbol} overflows"))
+            })
     }
 
     /// Marks an order as cancelled.
@@ -626,17 +741,25 @@ impl OrderManager {
         let mut stats = OrderManagerStats::default();
 
         for order in self.orders.values() {
-            stats.total_orders += 1;
-            stats.total_fills += order.fills.len();
+            stats.total_orders = stats.total_orders.saturating_add(1);
+            stats.total_fills = stats.total_fills.saturating_add(order.fills.len());
 
             match &order.status {
-                OrderStatus::Pending => stats.pending_orders += 1,
-                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
-                    stats.open_orders += 1
+                OrderStatus::Pending => {
+                    stats.pending_orders = stats.pending_orders.saturating_add(1)
                 }
-                OrderStatus::Filled { .. } => stats.filled_orders += 1,
-                OrderStatus::Cancelled { .. } => stats.cancelled_orders += 1,
-                OrderStatus::Rejected { .. } => stats.rejected_orders += 1,
+                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
+                    stats.open_orders = stats.open_orders.saturating_add(1)
+                }
+                OrderStatus::Filled { .. } => {
+                    stats.filled_orders = stats.filled_orders.saturating_add(1)
+                }
+                OrderStatus::Cancelled { .. } => {
+                    stats.cancelled_orders = stats.cancelled_orders.saturating_add(1)
+                }
+                OrderStatus::Rejected { .. } => {
+                    stats.rejected_orders = stats.rejected_orders.saturating_add(1)
+                }
             }
         }
 
@@ -712,28 +835,34 @@ impl ThreadSafeOrderManager {
 
     /// Executes a read operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn read<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn read<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&OrderManager) -> R,
     {
-        let guard = self.inner.read().unwrap();
-        f(&guard)
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&guard))
     }
 
     /// Executes a write operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn write<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn write<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&mut OrderManager) -> R,
     {
-        let mut guard = self.inner.write().unwrap();
-        f(&mut guard)
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&mut guard))
     }
 
     /// Registers a new order.
@@ -743,7 +872,7 @@ impl ThreadSafeOrderManager {
         client_order_id: String,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.register_order(request, client_order_id, timestamp))
+        self.write(|m| m.register_order(request, client_order_id, timestamp))?
     }
 
     /// Updates an order with exchange response.
@@ -753,46 +882,63 @@ impl ThreadSafeOrderManager {
         response: &OrderResponse,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.update_order(client_order_id, response, timestamp))
+        self.write(|m| m.update_order(client_order_id, response, timestamp))?
     }
 
     /// Records a fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`OrderManager::record_fill`] errors.
     pub fn record_fill(&self, fill: &Fill, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.record_fill(fill, timestamp))
+        self.write(|m| m.record_fill(fill, timestamp))?
     }
 
     /// Gets order statistics.
-    #[must_use]
-    pub fn get_stats(&self) -> OrderManagerStats {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn get_stats(&self) -> MMResult<OrderManagerStats> {
         self.read(|m| m.get_stats())
     }
 
     /// Gets the number of open orders.
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn open_order_count(&self) -> MMResult<usize> {
         self.read(|m| m.open_order_count())
     }
 
     /// Gets total open quantity for a side.
-    #[must_use]
-    pub fn get_open_quantity(&self, symbol: &str, side: Side) -> Decimal {
-        self.read(|m| m.get_open_quantity(symbol, side))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
+    /// sell.
+    pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
+        self.read(|m| m.get_open_quantity(symbol, side))?
     }
 
     /// Checks for timed out orders.
-    #[must_use]
-    pub fn check_timeouts(&self, current_time: u64) -> Vec<String> {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn check_timeouts(&self, current_time: u64) -> MMResult<Vec<String>> {
         self.read(|m| m.check_timeouts(current_time))
     }
 
     /// Marks an order as cancelled.
     pub fn mark_cancelled(&self, client_order_id: &str, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.mark_cancelled(client_order_id, timestamp))
+        self.write(|m| m.mark_cancelled(client_order_id, timestamp))?
     }
 
     /// Cleans up old orders.
-    pub fn cleanup(&self, retention_ms: u64, current_time: u64) {
-        self.write(|m| m.cleanup(retention_ms, current_time));
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn cleanup(&self, retention_ms: u64, current_time: u64) -> MMResult<()> {
+        self.write(|m| m.cleanup(retention_ms, current_time))
     }
 }
 
@@ -801,17 +947,37 @@ mod tests {
     use super::*;
     use crate::dec;
 
+    #[test]
+    fn test_fill_ratio_overfill_beyond_bounds_saturates() {
+        let id = OrderId::new("OVERFILL");
+        let mut order = ManagedOrder::new(
+            id.clone(),
+            "client".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(1),
+            dec!(0.0000000000000000000000000001),
+            0,
+        );
+        order
+            .record_fill(&create_test_fill(&id, dec!(1), dec!(10)), 1)
+            .unwrap();
+        assert_eq!(order.fill_ratio(), Decimal::MAX);
+    }
+
     fn create_test_request() -> OrderRequest {
         OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1))
     }
 
     fn create_test_fill(order_id: &OrderId, price: Decimal, quantity: Decimal) -> Fill {
         Fill {
+            symbol: "BTC-USD".to_string(),
             order_id: order_id.clone(),
             trade_id: "trade-1".to_string(),
             price,
             quantity,
-            side: Side::Buy,
+            side: Action::Buy,
             timestamp: 1000,
             fee: dec!(0.01),
             fee_currency: "USD".to_string(),
@@ -824,7 +990,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -840,12 +1006,32 @@ mod tests {
     }
 
     #[test]
+    fn test_managed_order_record_fill_overflow_returns_err_unchanged() {
+        let mut order = ManagedOrder::new(
+            OrderId::new("12345"),
+            "client-1".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(50000.0),
+            dec!(10.0),
+            1000,
+        );
+        let fill = create_test_fill(&order.order_id, Decimal::MAX, dec!(2));
+        let result = order.record_fill(&fill, 1001);
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        assert_eq!(order.filled_quantity, Decimal::ZERO);
+        assert_eq!(order.remaining_quantity, dec!(10.0));
+        assert!(order.fills.is_empty());
+    }
+
+    #[test]
     fn test_managed_order_record_fill() {
         let mut order = ManagedOrder::new(
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(1.0),
@@ -854,7 +1040,7 @@ mod tests {
 
         // Partial fill
         let fill1 = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
-        order.record_fill(&fill1, 1001);
+        order.record_fill(&fill1, 1001).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(0.3));
         assert_eq!(order.remaining_quantity, dec!(0.7));
@@ -863,7 +1049,7 @@ mod tests {
 
         // Another partial fill at different price
         let fill2 = create_test_fill(&order.order_id, dec!(49900.0), dec!(0.2));
-        order.record_fill(&fill2, 1002);
+        order.record_fill(&fill2, 1002).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(0.5));
         assert_eq!(order.remaining_quantity, dec!(0.5));
@@ -872,7 +1058,7 @@ mod tests {
 
         // Complete fill
         let fill3 = create_test_fill(&order.order_id, dec!(50100.0), dec!(0.5));
-        order.record_fill(&fill3, 1003);
+        order.record_fill(&fill3, 1003).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(1.0));
         assert_eq!(order.remaining_quantity, Decimal::ZERO);
@@ -1011,6 +1197,23 @@ mod tests {
     }
 
     #[test]
+    fn test_order_manager_open_quantity_overflow_returns_numerical_error() {
+        let mut manager = OrderManager::with_defaults();
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(1), Decimal::MAX);
+        manager
+            .register_order(&request, "a".to_string(), 1000)
+            .unwrap();
+        manager
+            .register_order(&request, "b".to_string(), 1001)
+            .unwrap();
+        let result = manager.get_open_quantity("BTC-USD", Action::Buy);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn test_order_manager_get_open_quantity() {
         let mut manager = OrderManager::with_defaults();
 
@@ -1027,10 +1230,10 @@ mod tests {
             .register_order(&sell_request, "sell-1".to_string(), 1002)
             .unwrap();
 
-        let buy_qty = manager.get_open_quantity("BTC-USD", Side::Buy);
+        let buy_qty = manager.get_open_quantity("BTC-USD", Action::Buy).unwrap();
         assert_eq!(buy_qty, dec!(1.0));
 
-        let sell_qty = manager.get_open_quantity("BTC-USD", Side::Sell);
+        let sell_qty = manager.get_open_quantity("BTC-USD", Action::Sell).unwrap();
         assert_eq!(sell_qty, dec!(0.3));
     }
 
@@ -1134,9 +1337,9 @@ mod tests {
             .register_order(&request, "client-1".to_string(), 1000)
             .unwrap();
 
-        assert_eq!(manager.open_order_count(), 1);
+        assert_eq!(manager.open_order_count().unwrap(), 1);
 
-        let stats = manager.get_stats();
+        let stats = manager.get_stats().unwrap();
         assert_eq!(stats.total_orders, 1);
         assert_eq!(stats.pending_orders, 1);
     }
@@ -1147,7 +1350,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -1165,7 +1368,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -1183,5 +1386,154 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: OrderManagerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.order_timeout_ms, deserialized.order_timeout_ms);
+    }
+
+    fn unsupported() -> MMError {
+        MMError::UnsupportedAction {
+            action: Action::Other,
+        }
+    }
+
+    #[test]
+    fn test_register_order_unsupported_action_registers_nothing() {
+        let mut manager = OrderManager::with_defaults();
+        let mut request = create_test_request();
+        request.side = Action::Other;
+
+        assert_eq!(
+            manager.register_order(&request, "client-1".to_string(), 1000),
+            Err(unsupported())
+        );
+        assert_eq!(manager.order_count(), 0);
+        assert_eq!(manager.open_order_count(), 0);
+        assert!(!manager.has_order_by_client_id("client-1"));
+    }
+
+    #[test]
+    fn test_register_order_checked_unsupported_action_skips_the_policy() {
+        use crate::risk::RiskLimits;
+        use crate::risk::pretrade::LimitsPolicy;
+
+        let mut manager = OrderManager::with_defaults();
+        let mut policy =
+            LimitsPolicy::new(RiskLimits::new(dec!(10), dec!(1_000_000), dec!(0)).unwrap());
+        let mut request = create_test_request();
+        request.side = Action::Other;
+
+        assert_eq!(
+            manager.register_order_checked(
+                &request,
+                "client-1".to_string(),
+                1000,
+                OrderPurpose::Quote,
+                &mut policy,
+            ),
+            Err(unsupported())
+        );
+        assert_eq!(manager.order_count(), 0);
+        // The policy reserved nothing.
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), Decimal::ZERO);
+        assert_eq!(policy.live_quantity(Action::Sell).unwrap(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_record_fill_unsupported_action_leaves_order_unchanged() {
+        let mut manager = OrderManager::with_defaults();
+        manager
+            .register_order(&create_test_request(), "client-1".to_string(), 1000)
+            .unwrap();
+        let exchange_id = OrderId::new("exchange-123");
+        let response = OrderResponse::new(
+            exchange_id.clone(),
+            OrderStatus::Open {
+                filled_qty: Decimal::ZERO,
+            },
+            1001,
+        );
+        manager.update_order("client-1", &response, 1001).unwrap();
+        let before = manager.get_order_by_client_id("client-1").unwrap().clone();
+
+        let mut fill = create_test_fill(&exchange_id, dec!(50000.0), dec!(0.1));
+        fill.side = Action::Other;
+        assert_eq!(manager.record_fill(&fill, 1002), Err(unsupported()));
+
+        let after = manager.get_order_by_client_id("client-1").unwrap();
+        assert_eq!(after.filled_quantity, before.filled_quantity);
+        assert_eq!(after.status, before.status);
+        assert!(after.fills.is_empty());
+        assert_eq!(manager.open_order_count(), 1);
+    }
+
+    #[test]
+    fn test_get_open_quantity_unsupported_action_returns_err() {
+        let mut manager = OrderManager::with_defaults();
+        manager
+            .register_order(&create_test_request(), "client-1".to_string(), 1000)
+            .unwrap();
+        assert_eq!(
+            manager.get_open_quantity("BTC-USD", Action::Other),
+            Err(unsupported())
+        );
+
+        let shared = ThreadSafeOrderManager::with_defaults();
+        assert_eq!(
+            shared.get_open_quantity("BTC-USD", Action::Other),
+            Err(unsupported())
+        );
+        assert_eq!(
+            shared.get_open_quantity("BTC-USD", Action::Buy).unwrap(),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn test_managed_order_record_fill_unsupported_action_leaves_order_unchanged() {
+        let order = ManagedOrder::new(
+            OrderId::new("12345"),
+            "client-1".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(50000.0),
+            dec!(1.0),
+            1000,
+        );
+
+        // An unsupported fill side.
+        let mut direct = order.clone();
+        let mut fill = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
+        fill.side = Action::Other;
+        assert_eq!(direct.record_fill(&fill, 1001), Err(unsupported()));
+
+        // An order whose side the caller changed to an unsupported one.
+        let mut altered = order.clone();
+        altered.side = Action::Other;
+        let fill = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
+        assert_eq!(altered.record_fill(&fill, 1001), Err(unsupported()));
+
+        for unchanged in [&direct, &altered] {
+            assert_eq!(unchanged.filled_quantity, Decimal::ZERO);
+            assert_eq!(unchanged.remaining_quantity, dec!(1.0));
+            assert_eq!(unchanged.average_fill_price, Decimal::ZERO);
+            assert_eq!(unchanged.status, OrderStatus::Pending);
+            assert_eq!(unchanged.updated_at, 1000);
+            assert!(unchanged.fills.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_thread_safe_order_manager_poisoned_lock_returns_lock_poisoned() {
+        let manager = ThreadSafeOrderManager::new(OrderManagerConfig::default());
+        let clone = manager.clone();
+        let joined = std::thread::spawn(move || {
+            let _ = clone.write(|_| panic!("poison the lock"));
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(matches!(
+            manager.open_order_count(),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(manager.get_stats(), Err(MMError::LockPoisoned(_))));
     }
 }

@@ -6,12 +6,15 @@
 //! Run with: `cargo run --example chain_market_making --features chain`
 
 use market_maker_rs::chain::{
-    ChainMarketMaker, ChainMarketMakerConfig, ChainRiskLimits, ChainRiskManager,
+    ChainMarketMaker, ChainMarketMakerConfig, ChainPricing, ChainQuoteOutcome, ChainRiskLimits,
+    ChainRiskManager,
 };
-use market_maker_rs::options::PositionGreeks;
+use market_maker_rs::options::{
+    Dynamics, FlatSurface, PositionGreeks, SurfacePricer, tau_from_days,
+};
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
 use optionstratlib::model::ExpirationDate;
-use optionstratlib::pos;
+use optionstratlib::prelude::pos_or_panic;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ fn main() {
     println!("=== Option Chain Market Making ===\n");
 
     // Create an expiration order book for BTC options
-    let expiration = ExpirationDate::Days(pos!(30.0));
+    let expiration = ExpirationDate::Days(pos_or_panic!(30.0));
     let chain = ExpirationOrderBook::new("BTC", expiration);
 
     // Add strikes to the chain
@@ -82,29 +85,48 @@ fn main() {
     println!("  Strike Count: {}", market_maker.strike_count());
     println!();
 
+    // Valuation inputs for this expiration: a flat 60 % implied volatility,
+    // sticky moneyness, no rates, 30 days to expiry.
+    let surface = FlatSurface::new(dec!(0.6)).expect("valid volatility");
+    let pricer =
+        SurfacePricer::new(Arc::new(surface), Dynamics::StickyMoneyness).expect("valid dynamics");
+    let tau = tau_from_days(dec!(30)).expect("valid time to expiry");
+    let pricing = ChainPricing::new(Arc::new(pricer), tau, dec!(0.0), dec!(0.0))
+        .expect("valid pricing inputs");
+
     // Refresh all quotes
     println!("=== Quote Generation ===\n");
 
-    let quotes = market_maker
-        .refresh_all_quotes(underlying_price)
+    let outcomes = market_maker
+        .refresh_all_quotes(underlying_price, &pricing)
         .expect("Failed to refresh quotes");
 
-    println!("Generated {} quotes:", quotes.len());
+    println!("Generated {} outcomes:", outcomes.len());
     println!();
 
-    for quote in &quotes {
-        let is_atm = quote.strike == atm_strike;
-        let atm_marker = if is_atm { " (ATM)" } else { "" };
+    for outcome in &outcomes {
+        match outcome {
+            ChainQuoteOutcome::Quote(quote) => {
+                let is_atm = quote.strike == atm_strike;
+                let atm_marker = if is_atm { " (ATM)" } else { "" };
 
-        println!("  ${} {:?}{}:", quote.strike, quote.style, atm_marker);
-        println!(
-            "    Bid: ${} x {}  |  Ask: ${} x {}",
-            quote.bid_price, quote.bid_size, quote.ask_price, quote.ask_size
-        );
-        println!(
-            "    Theo: ${}  |  Spread: {} bps",
-            quote.theo, quote.spread_bps
-        );
+                println!("  ${} {:?}{}:", quote.strike, quote.style, atm_marker);
+                println!(
+                    "    Bid: ${} x {}  |  Ask: ${} x {}",
+                    quote.bid_price, quote.bid_size, quote.ask_price, quote.ask_size
+                );
+                println!(
+                    "    Theo: ${} (model {:.4})  |  Spread: {} bps  |  Delta: {:.4}",
+                    quote.theo, quote.valuation.price, quote.spread_bps, quote.valuation.delta
+                );
+            }
+            ChainQuoteOutcome::NotQuoted {
+                strike,
+                style,
+                reason,
+            } => println!("  ${strike} {style:?}: not quoted ({reason})"),
+            _ => println!("  unknown outcome"),
+        }
     }
     println!();
 
@@ -113,7 +135,9 @@ fn main() {
 
     for strike in &strikes {
         let is_atm = *strike == atm_strike;
-        let multiplier = market_maker.get_spread_multiplier(*strike, underlying_price, is_atm);
+        let multiplier = market_maker
+            .get_spread_multiplier(*strike, underlying_price, is_atm)
+            .expect("valid spread multiplier");
         println!(
             "  ${}: {:.2}x {}",
             strike,
@@ -126,7 +150,9 @@ fn main() {
     // Risk status
     println!("=== Chain Risk Status ===\n");
 
-    let risk_status = market_maker.check_chain_risk();
+    let risk_status = market_maker
+        .check_chain_risk()
+        .expect("Failed to check chain risk");
     println!("Risk Status: {:?}", risk_status);
     println!("  Can Quote: {}", risk_status.can_quote());
     println!("  Requires Action: {}", risk_status.requires_action());
@@ -161,17 +187,24 @@ fn main() {
         PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
     // Add 100 contracts across the chain
-    risk_manager.add_position_greeks(&call_greeks, dec!(100.0));
+    risk_manager
+        .add_position_greeks(&call_greeks, dec!(100.0))
+        .expect("Failed to add position");
 
     println!("After adding 100 call contracts:");
     println!("  Chain Delta: {}", risk_manager.current_greeks().delta);
     println!("  Chain Gamma: {}", risk_manager.current_greeks().gamma);
-    println!("  Should Hedge: {}", risk_manager.should_hedge());
+    let should_hedge = risk_manager
+        .should_hedge()
+        .expect("Failed to check the hedge");
+    println!("  Should Hedge: {should_hedge}");
     println!();
 
     // Calculate hedge
-    if risk_manager.should_hedge() {
-        let hedges = risk_manager.calculate_hedge(dec!(50000.0));
+    if should_hedge {
+        let hedges = risk_manager
+            .calculate_hedge(dec!(50000.0))
+            .expect("Failed to calculate hedge");
         if !hedges.is_empty() {
             println!("Hedge Orders:");
             for hedge in &hedges {
@@ -194,12 +227,26 @@ fn main() {
     println!("Dollar Greeks (at ${}):", underlying_price);
     println!(
         "  Dollar Delta: ${:.2}",
-        risk_manager.dollar_delta(dec!(50000.0))
+        risk_manager
+            .dollar_delta(dec!(50000.0))
+            .expect("Failed to calculate dollar delta")
     );
     println!(
         "  Dollar Gamma: ${:.2}",
-        risk_manager.dollar_gamma(dec!(50000.0))
+        risk_manager
+            .dollar_gamma(dec!(50000.0))
+            .expect("Failed to calculate dollar gamma")
     );
-    println!("  Dollar Vega: ${:.2}", risk_manager.dollar_vega());
-    println!("  Dollar Theta: ${:.2}/day", risk_manager.dollar_theta());
+    println!(
+        "  Dollar Vega: ${:.2}",
+        risk_manager
+            .dollar_vega()
+            .expect("Failed to calculate dollar vega")
+    );
+    println!(
+        "  Dollar Theta: ${:.2}/day",
+        risk_manager
+            .dollar_theta()
+            .expect("Failed to calculate dollar theta")
+    );
 }
